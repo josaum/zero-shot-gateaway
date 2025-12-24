@@ -14,7 +14,8 @@ This project demonstrates a radical "One-File" architecture where a highly capab
 ## 🚀 Features
 
 1.  **Learned Schemas**: Send any JSON event to `/ingest`. The system automatically learns the schema, tracks fields, and keeps a sample.
-2.  **Context-Aware Chat**: Talk to the system in natural language. It uses the learned schemas to understand what you want (Intent Detection) and extracts the necessary details (Slot Filling).
+2.  **Reflexive & Persistence**: Configuring the system via `SystemConfig` events triggers immediate self-reconfiguration. It emits the full learned ontology (TTL) and data history (JSON-LD) to a webhook on every change.
+3.  **Context-Aware Chat**: Talk to the system in natural language. It uses the learned schemas to understand what you want (Intent Detection) and extracts the necessary details (Slot Filling).
 
 4.  **Zero-Latency UI**: A real-time dashboard powered by HTMX that updates instantly as events arrive or chat occurs.
 
@@ -45,7 +46,7 @@ Because this uses a single binary, you just need to run:
 cargo run --bin one_file_gateway
 ```
 
-Once running, open your browser to: **`http://127.0.0.1:3000`**
+Once running, open your browser to: **`http://127.0.0.1:9382`**
 
 ---
 
@@ -54,9 +55,22 @@ Once running, open your browser to: **`http://127.0.0.1:3000`**
 ### 1. Ingestion (The Learning Phase)
 Feed the system some data. It will "learn" that these event types exist.
 
+**Configure the System (Reflexivity):**
+First, tell the system where to send the ontology and what IRI to use.
+```bash
+curl -X POST http://127.0.0.1:9382/ingest \
+  -H "Content-Type: application/json" \
+  -d '{
+    "type": "SystemConfig",
+    "webhook_url": "https://webhook.site/your-id",
+    "ontology_iri": "http://my-org.com/ontology/"
+  }'
+```
+*The system immediately reacts by exporting its current state to the webhook.*
+
 **Ingest a `UserSignup` event:**
 ```bash
-curl -X POST http://127.0.0.1:3000/ingest \
+curl -X POST http://127.0.0.1:9382/ingest \
   -H "Content-Type: application/json" \
   -d '{
     "type": "UserSignup",
@@ -68,7 +82,7 @@ curl -X POST http://127.0.0.1:3000/ingest \
 
 **Ingest a `PaymentProcessed` event:**
 ```bash
-curl -X POST http://127.0.0.1:3000/ingest \
+curl -X POST http://127.0.0.1:9382/ingest \
   -H "Content-Type: application/json" \
   -d '{
     "type": "PaymentProcessed",

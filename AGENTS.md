@@ -15,3 +15,5 @@
 - **Error Handling**: Use `Result` for fallible operations in handlers. `unwrap()`/`expect()` are acceptable for startup initialization or strict prototypes but prefer `match` or `?` in production code.
 - **Dependencies**: New dependencies must be added to `Cargo.toml`.
 - **LLM Integration**: Maintain strict JSON schema definitions for OpenAI calls.
+- **Reflexivity**: The system reacts to `SystemConfig` events to update its own configuration (webhook_url, ontology_iri).
+- **Persistence**: Full ontology (TTL) and ABox (JSON-LD) are emitted to the configured webhook on every state change.

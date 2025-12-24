@@ -17,14 +17,17 @@ struct LearnedSchema {
     name: String,             // e.g., "InvoiceEvent"
     fields: HashSet<String>,  // e.g., {"amount", "vendor_email"}
     sample_data: String,      // A JSON snapshot for the AI to understand context
+    #[serde(default)]
+    jsonld_context: Option<serde_json::Value>, // Captured @context
 }
 
 impl LearnedSchema {
-    fn new(name: String, sample_data: String) -> Self {
+    fn new(name: String, sample_data: String, jsonld_context: Option<serde_json::Value>) -> Self {
         Self {
             name,
             fields: HashSet::new(),
             sample_data,
+            jsonld_context,
         }
     }
 }
@@ -34,11 +37,15 @@ fn learn_schema(schemas: &mut HashMap<String, LearnedSchema>, type_name: String,
     let fields: HashSet<String> = payload.as_object()
         .map(|obj| obj.keys().cloned().collect())
         .unwrap_or_default();
+    
+    // Capture @context if present
+    let context = payload.get("@context").cloned();
 
     let entry = schemas.entry(type_name.clone()).or_insert_with(|| {
         LearnedSchema::new(
             type_name.clone(),
             serde_json::to_string_pretty(payload).unwrap_or_default(),
+            context
         )
     });
     
@@ -62,6 +69,13 @@ struct SessionState {
     collected_slots: HashMap<String, String>, 
 }
 
+// Dynamic System Configuration
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct Config {
+    webhook_url: Option<String>,
+    ontology_iri: String, 
+}
+
 // Global Application State
 struct AppState {
     // The Database (Embedded OLAP)
@@ -70,7 +84,8 @@ struct AppState {
     schemas: RwLock<HashMap<String, LearnedSchema>>,
     // User Session (Simplified for single user demo)
     session: Mutex<SessionState>,
-
+    // System Configuration
+    config: RwLock<Config>,
 }
 
 // =================================================================================
@@ -161,6 +176,10 @@ async fn main() {
             active_intent: None,
             collected_slots: HashMap::new(),
         }),
+        config: RwLock::new(Config {
+            webhook_url: None, // Will be set via ingestion
+            ontology_iri: "http://example.org/ontology/".to_string(),
+        }),
     });
 
     // B. Build the Router
@@ -183,6 +202,55 @@ async fn main() {
 // 4. THE INGESTION ENGINE (The Learning Loop)
 // =================================================================================
 
+async fn perform_export(state: Arc<AppState>) {
+    let (config, schemas) = {
+        (state.config.read().clone(), state.schemas.read().clone())
+    };
+
+    if let Some(url) = config.webhook_url {
+        println!("📤 Exporting Ontology & ABox to {}", url);
+        
+        // 1. Generate TBox (Turtle)
+        let mut ttl = format!("@prefix : <{}> .\n", config.ontology_iri);
+        ttl.push_str("@prefix owl: <http://www.w3.org/2002/07/owl#> .\n");
+        ttl.push_str("@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\n");
+        
+        for (name, schema) in &schemas {
+            ttl.push_str(&format!(":{} a owl:Class ;\n", name));
+            ttl.push_str(&format!("    rdfs:label \"{}\" .\n", name));
+            for field in &schema.fields {
+                ttl.push_str(&format!(":{} :hasField \"{}\" .\n", name, field));
+            }
+        }
+
+        // 2. Generate ABox (JSON-LD)
+        let events_json: String = {
+            let db = state.db.lock();
+            let mut stmt = db.prepare("SELECT payload FROM events ORDER BY received_at DESC LIMIT 100").unwrap();
+            let rows: Vec<String> = stmt.query_map([], |row| {
+                 let json_str: String = row.get(0)?;
+                 Ok(json_str)
+            }).unwrap().map(|r| r.unwrap()).collect();
+            
+            format!("[{}]", rows.join(","))
+        };
+        
+        // 3. Payload
+        let payload = serde_json::json!({
+            "ontology_ttl": ttl,
+            "abox_jsonld": serde_json::from_str::<serde_json::Value>(&events_json).unwrap_or_default(),
+            "exported_at": Local::now().to_rfc3339()
+        });
+
+        // 4. Send
+        let client = reqwest::Client::new();
+        match client.post(&url).json(&payload).send().await {
+            Ok(_) => println!("✅ Export success"),
+            Err(e) => println!("❌ Export failed: {}", e),
+        }
+    }
+}
+
 async fn ingest_handler(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<serde_json::Value>,
@@ -196,6 +264,19 @@ async fn ingest_handler(
         .unwrap_or("UnknownEvent")
         .to_string();
 
+    // 1.5 React: Dynamic Configuration
+    if type_name == "SystemConfig" {
+        let mut config = state.config.write();
+        if let Some(url) = payload.get("webhook_url").and_then(|v| v.as_str()) {
+             config.webhook_url = Some(url.to_string());
+             println!("🔗 Webhook updated: {}", url);
+        }
+        if let Some(iri) = payload.get("ontology_iri").and_then(|v| v.as_str()) {
+             config.ontology_iri = iri.to_string();
+             println!("🧠 Ontology IRI updated: {}", iri);
+        }
+    }
+
     // 2. Persist: Write to DuckDB
     let now = Local::now().to_rfc3339();
     db.execute(
@@ -207,7 +288,10 @@ async fn ingest_handler(
     // If this is a new event or has new fields, we update our "Brain"
     learn_schema(&mut schemas, type_name.clone(), &payload);
 
-    // 4. Notify UI (HTMX Out-of-Band Swap)
+    // 4. Emit: Trigger Export Logic
+    tokio::spawn(perform_export(state.clone()));
+
+    // 5. Notify UI (HTMX Out-of-Band Swap)
     // This pushes the log to the browser without a refresh!
     let html = format!(
         r#"<div id="event-log" hx-swap-oob="afterbegin">
@@ -507,7 +591,7 @@ mod tests {
 
     #[test]
     fn test_check_missing_slots() {
-        let mut schema = LearnedSchema::new("Test".into(), "{}".into());
+        let mut schema = LearnedSchema::new("Test".into(), "{}".into(), None);
         schema.fields.insert("email".into());
         schema.fields.insert("name".into());
         
