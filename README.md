@@ -8,16 +8,16 @@ This project demonstrates a radical "One-File" architecture where a highly capab
 *   **OpenAI (GPT-4o)**: Strict JSON intent detection and slot filling.
 *   **HTMX / Tailwind**: Server-side rendered, zero-build frontend.
 
-
 ---
 
 ## 🚀 Features
 
 1.  **Learned Schemas**: Send any JSON event to `/ingest`. The system automatically learns the schema, tracks fields, and keeps a sample.
 2.  **Reflexive & Persistence**: Configuring the system via `SystemConfig` events triggers immediate self-reconfiguration. It emits the full learned ontology (TTL) and data history (JSON-LD) to a webhook on every change.
-3.  **Context-Aware Chat**: Talk to the system in natural language. It uses the learned schemas to understand what you want (Intent Detection) and extracts the necessary details (Slot Filling).
-
-4.  **Zero-Latency UI**: A real-time dashboard powered by HTMX that updates instantly as events arrive or chat occurs.
+3.  **Resilient Exports**: Exports are batched (default: 5 events) with automatic retry and exponential backoff for reliability.
+4.  **Observability**: Structured logging with `/metrics` and `/health` endpoints for production monitoring.
+5.  **Context-Aware Chat**: Talk to the system in natural language. It uses the learned schemas to understand what you want (Intent Detection) and extracts the necessary details (Slot Filling).
+6.  **Zero-Latency UI**: A real-time dashboard powered by HTMX that updates instantly as events arrive or chat occurs.
 
 ---
 
@@ -29,8 +29,8 @@ Ensure you have the latest stable Rust installed.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-### 3. OpenAI API Key
-Required for the implementation of the "Agent" intelligence.
+### 2. OpenAI API Key
+Required for the "Agent" intelligence.
 ```bash
 export OPENAI_API_KEY="sk-..."
 ```
@@ -48,6 +48,13 @@ cargo run --bin one_file_gateway
 
 Once running, open your browser to: **`http://127.0.0.1:9382`**
 
+### Endpoints
+- **UI & Chat**: `http://127.0.0.1:9382`
+- **Ingestion**: `POST http://127.0.0.1:9382/ingest`
+- **Config**: `POST http://127.0.0.1:9382/config`
+- **Health**: `GET http://127.0.0.1:9382/health`
+- **Metrics**: `GET http://127.0.0.1:9382/metrics`
+
 ---
 
 ## 📖 Usage Examples
@@ -55,8 +62,11 @@ Once running, open your browser to: **`http://127.0.0.1:9382`**
 ### 1. Ingestion (The Learning Phase)
 Feed the system some data. It will "learn" that these event types exist.
 
-**Configure the System (Reflexivity):**
-First, tell the system where to send the ontology and what IRI to use.
+**Configure via UI:**
+Use the Config panel in the sidebar to set webhook URL and batch size.
+
+**Configure via API (Reflexivity):**
+First, tell the system where to send the ontology.
 ```bash
 curl -X POST http://127.0.0.1:9382/ingest \
   -H "Content-Type: application/json" \
@@ -97,7 +107,7 @@ curl -X POST http://127.0.0.1:9382/ingest \
 ---
 
 ### 2. The Agent (The Acting Phase)
-Go to the chat interface in the browser (or use curl) to interact with the agent. It knows about the events you just sent.
+Go to the chat interface in the browser to interact with the agent. It knows about the events you just sent.
 
 **User:** "I want to manually record a new signup."
 **Agent:** "I can help with that. I detected you want to trigger a `UserSignup`. Please provide the `email` and `plan`."
@@ -105,16 +115,41 @@ Go to the chat interface in the browser (or use curl) to interact with the agent
 **User:** "It's for bob@test.com and he is on the Starter plan."
 **Agent:** "Captured `email`=bob@test.com, `plan`=Starter. I still need the `region`."
 
+---
+
+## 📊 Monitoring
+
+### Health Check
+```bash
+curl http://127.0.0.1:9382/health
+# Returns: OK
+```
+
+### Metrics
+```bash
+curl http://127.0.0.1:9382/metrics
+# Returns JSON:
+# {
+#   "events_ingested": 42,
+#   "schemas_learned": 3,
+#   "exports_attempted": 8,
+#   "exports_succeeded": 7,
+#   "exports_failed": 1,
+#   "last_export_at": "2025-12-24T21:30:00+00:00",
+#   "pending_exports": 2,
+#   "webhook_configured": true,
+#   "export_batch_size": 5
+# }
+```
 
 ---
 
 ## 🧠 Architecture Notes
 
 - **One File**: Everything (DB init, UI HTML, API routes, Logic) is in `src/main.rs`.
-- **Concurrency**: 
+- **Concurrency**:
     - `AppState` is wrapped in `Arc` and shared across threads.
     - `Mutex` protects the DuckDB connection and Session state.
     - `RwLock` protects the Schema Registry for high-concurrency reads.
-
+- **Export Strategy**: Events are queued and exported in batches. Failed exports are retried 3 times with exponential backoff.
 - **Strict JSON**: We use OpenAI's `response_format: { type: "json_schema", ... }` to ensure the LLM *always* responds with valid machine-readable JSON, eliminating parsing errors.
-

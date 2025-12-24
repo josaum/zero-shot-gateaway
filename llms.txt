@@ -1,0 +1,109 @@
+# LLMs.txt - One-File Event Gateway
+
+## Project Overview
+A single-file Rust event gateway that combines:
+- **Ingestion Engine**: Learns schemas from incoming JSON events
+- **OLAP Database**: Embedded DuckDB for event persistence
+- **AI Agent**: GPT-4o for intent detection and slot filling
+- **Ontology Reasoner**: Exports TTL (TBox) and JSON-LD (ABox) to webhooks
+- **HTMX UI**: Real-time dashboard with zero client-side JS
+
+## File Structure
+```
+/
+├── src/main.rs          # Single-file implementation (all code here)
+├── Cargo.toml           # Dependencies
+├── AGENTS.md           # Build/lint/test commands & conventions
+├── README.md           # User-facing documentation
+├── llms.txt            # This file (for AI assistants)
+├── LICENSE             # MIT License
+└── .github/workflows/ci.yml  # CI pipeline
+```
+
+## Dependencies
+```toml
+axum = "0.7"           # Web framework
+tokio = "1"            # Async runtime
+duckdb = "1.0"         # Embedded OLAP DB
+serde = "1"            # Serialization
+serde_json = "1"       # JSON handling
+parking_lot = "0.12"   # Fast mutexes
+chrono = "0.4"         # Time handling
+reqwest = "0.12"       # HTTP client
+tracing = "0.1"        # Structured logging
+tracing-subscriber = "0.3"  # Logging subscriber
+```
+
+## Build Commands
+```bash
+cargo build              # Debug build
+cargo build --release    # Optimized build
+cargo check              # Type checking
+cargo clippy             # Linting
+cargo test               # Run tests
+cargo test -- <pattern>  # Run matching tests
+cargo run                # Run development server on port 9382
+```
+
+## Code Style (One-File Architecture)
+- **ALL code** must remain in `src/main.rs` unless explicitly instructed otherwise
+- Use `snake_case` for variables/functions
+- Use `PascalCase` for structs/enums
+- Group imports: std → external crates
+- Prefer `Arc<AppState>` with `parking_lot::Mutex` or `RwLock` for shared state
+- Use `Result` for fallible operations; prefer `?` operator
+- Keep handler logic focused; extract pure functions for testing
+
+## Key Patterns
+
+### AppState Structure
+```rust
+struct AppState {
+    db: Mutex<Connection>,           // DuckDB
+    schemas: RwLock<HashMap<...>>,   // Schema registry
+    session: Mutex<SessionState>,    // Chat session
+    config: RwLock<Config>,          // Runtime config
+    export_queue: Mutex<Vec<...>>,   // Pending exports
+    metrics: Mutex<Metrics>,         // Observability
+}
+```
+
+### Ingestion Flow
+1. Parse JSON payload
+2. Update schema registry (learn new types/fields)
+3. Persist to DuckDB
+4. Queue for batch export
+5. Trigger export if batch size reached
+6. Return HTMX snippet for UI update
+
+### Export Strategy
+- Events queued in memory
+- Export triggered when queue >= batch_size (default: 5)
+- HTTP POST to webhook with TTL + JSON-LD
+- Retry 3 times with exponential backoff (2^attempt seconds)
+
+### LLM Integration
+- Uses OpenAI Structured Outputs (`response_format: { type: "json_schema", ... }`)
+- Schema defines: intent, slots, message
+- Strict mode ensures valid JSON responses
+
+## Routes
+| Method | Path | Handler |
+|--------|------|---------|
+| GET | / | ui_handler |
+| POST | /ingest | ingest_handler |
+| POST | /chat | chat_handler |
+| POST | /config | config_handler |
+| GET | /health | health_handler |
+| GET | /metrics | metrics_handler |
+
+## Testing
+- Unit tests in `#[cfg(test)] mod tests` at end of file
+- Test pure functions: `learn_schema`, `check_missing_slots`
+- Tests must not require external services (LLM, database)
+
+## Important Notes
+- Set `OPENAI_API_KEY` environment variable before running
+- Webhook URL and batch size configurable at runtime
+- Exports include full ontology (TTL) and recent events (JSON-LD)
+- UI updates via HTMX out-of-band swaps for real-time experience
