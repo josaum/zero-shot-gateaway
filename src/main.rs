@@ -7,8 +7,9 @@ use axum::{
 use duckdb::{params, Connection};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::{collections::{HashMap, HashSet}, sync::Arc, env};
+use std::{collections::{HashMap, HashSet}, sync::Arc, env, time::Duration};
 use chrono::Local;
+use tracing::{info, warn, error};
 
 
 // The "Truth" derived from the event stream
@@ -73,10 +74,15 @@ struct SessionState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Config {
     webhook_url: Option<String>,
-    ontology_iri: String, 
+    ontology_iri: String,
+    #[serde(default)]
+    export_batch_size: usize, 
+    #[serde(default)]
+    export_interval_secs: u64,
 }
 
 // Global Application State
+#[derive(Debug)]
 struct AppState {
     // The Database (Embedded OLAP)
     db: Mutex<Connection>,
@@ -86,6 +92,20 @@ struct AppState {
     session: Mutex<SessionState>,
     // System Configuration
     config: RwLock<Config>,
+    // Export Queue for retry logic
+    export_queue: Mutex<Vec<(String, serde_json::Value)>>,
+    // Metrics
+    metrics: Mutex<Metrics>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct Metrics {
+    events_ingested: usize,
+    schemas_learned: usize,
+    exports_attempted: usize,
+    exports_succeeded: usize,
+    exports_failed: usize,
+    last_export_at: Option<String>,
 }
 
 // =================================================================================
@@ -136,15 +156,30 @@ const HTML_TEMPLATE: &str = r##"
                     Send
                 </button>
             </form>
+            <form hx-post="/config" hx-target="#app-root" hx-swap="outerHTML" class="mt-2 flex gap-2 p-2 bg-gray-900 rounded">
+                <input type="text" name="webhook_url" placeholder="Webhook URL..."
+                       class="flex-1 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs">
+                <input type="number" name="batch_size" placeholder="Batch size" value="5"
+                       class="w-20 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs">
+                <button type="submit" class="bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded text-xs">Set Config</button>
+            </form>
         </div>
     </div>
 
     <div class="w-1/3 bg-gray-950 flex flex-col">
         <div class="p-4 border-b border-gray-800 bg-gray-900">
              <h2 class="text-xs font-bold text-purple-500 uppercase tracking-widest">Learned Schemas</h2>
+             <div class="text-xs text-gray-600 mt-1">{{ CONFIG_STATUS }}</div>
         </div>
         <div class="p-6 space-y-6">
             {{ SCHEMA_VISUALIZATION }}
+        </div>
+        <div class="p-4 border-t border-gray-800">
+             <h3 class="text-xs font-bold text-yellow-500 uppercase tracking-widest mb-2">Quick Links</h3>
+             <div class="flex gap-2 text-xs">
+                 <a href="/metrics" target="_blank" class="text-blue-400 hover:underline">📊 Metrics</a>
+                 <a href="/health" target="_blank" class="text-green-400 hover:underline">💚 Health</a>
+             </div>
         </div>
     </div>
 
@@ -177,9 +212,23 @@ async fn main() {
             collected_slots: HashMap::new(),
         }),
         config: RwLock::new(Config {
-            webhook_url: None, // Will be set via ingestion
+            webhook_url: None,
             ontology_iri: "http://example.org/ontology/".to_string(),
+            export_batch_size: 5,
+            export_interval_secs: 30,
         }),
+        export_queue: Mutex::new(Vec::new()),
+        metrics: Mutex::new(Metrics::default()),
+    });
+
+    // Setup tracing
+    tracing_subscriber::fmt().init();
+    info!("⚡ MASTER ONE-FILE ACTIVE");
+
+    // Graceful shutdown signal handler
+    tokio::spawn(async move {
+        let _ = tokio::signal::ctrl_c().await;
+        info!("Received shutdown signal");
     });
 
     // B. Build the Router
@@ -187,69 +236,127 @@ async fn main() {
         .route("/", get(ui_handler))
         .route("/chat", post(chat_handler))
         .route("/ingest", post(ingest_handler))
+        .route("/config", post(config_handler))
+        .route("/health", get(health_handler))
+        .route("/metrics", get(metrics_handler))
 
         .with_state(state);
 
-    println!("⚡ MASTER ONE-FILE ACTIVE");
-    println!("   > UI & Chat: http://127.0.0.1:9382");
-    println!("   > Ingestion: POST http://127.0.0.1:9382/ingest");
+    info!("   > UI & Chat: http://127.0.0.1:9382");
+    info!("   > Ingestion: POST http://127.0.0.1:9382/ingest");
+    info!("   > Config: POST http://127.0.0.1:9382/config");
+    info!("   > Health: GET http://127.0.0.1:9382/health");
+    info!("   > Metrics: GET http://127.0.0.1:9382/metrics");
 
     let listener = tokio::net::TcpListener::bind("0.0.0.0:9382").await.unwrap();
-    axum::serve(listener, app).await.unwrap();
+    axum::serve(listener, app).await;
 }
 
 // =================================================================================
 // 4. THE INGESTION ENGINE (The Learning Loop)
 // =================================================================================
 
+#[derive(Deserialize)]
+struct IngestPayload {
+    #[serde(rename = "type")]
+    event_type: Option<String>,
+    webhook_url: Option<String>,
+    ontology_iri: Option<String>,
+}
+
 async fn perform_export(state: Arc<AppState>) {
-    let (config, schemas) = {
-        (state.config.read().clone(), state.schemas.read().clone())
+    let (url, ontology_iri, events, schemas_data) = {
+        let config = state.config.read();
+        let mut queue = state.export_queue.lock();
+        
+        if queue.is_empty() {
+            return;
+        }
+
+        let events = queue.drain(..).collect::<Vec<_>>();
+        let url = config.webhook_url.clone();
+        let ontology_iri = config.ontology_iri.clone();
+        
+        let schemas = state.schemas.read();
+        let schemas_data: Vec<(String, HashSet<String>, Option<serde_json::Value>, String)> = schemas.iter()
+            .map(|(name, s)| (name.clone(), s.fields.clone(), s.jsonld_context.clone(), s.sample_data.clone()))
+            .collect();
+        
+        (url, ontology_iri, events, schemas_data)
     };
 
-    if let Some(url) = config.webhook_url {
-        println!("📤 Exporting Ontology & ABox to {}", url);
+    if let Some(url) = url {
+        info!("📤 Exporting {} events to {}", events.len(), url);
         
-        // 1. Generate TBox (Turtle)
-        let mut ttl = format!("@prefix : <{}> .\n", config.ontology_iri);
+        // Update metrics
+        {
+            let mut m = state.metrics.lock();
+            m.exports_attempted += events.len();
+        }
+        
+        // 1. Generate TBox (Turtle) with proper RDF
+        let mut ttl = format!("@prefix : <{}> .\n", ontology_iri);
         ttl.push_str("@prefix owl: <http://www.w3.org/2002/07/owl#> .\n");
-        ttl.push_str("@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n\n");
+        ttl.push_str("@prefix rdfs: <http://www.w3.org/2000/01/rdf-schema#> .\n");
+        ttl.push_str("@prefix xsd: <http://www.w3.org/2001/XMLSchema#> .\n\n");
         
-        for (name, schema) in &schemas {
+        for (name, fields, _, _) in &schemas_data {
             ttl.push_str(&format!(":{} a owl:Class ;\n", name));
-            ttl.push_str(&format!("    rdfs:label \"{}\" .\n", name));
-            for field in &schema.fields {
-                ttl.push_str(&format!(":{} :hasField \"{}\" .\n", name, field));
+            ttl.push_str(&format!("    rdfs:label \"{}\" ;\n", name));
+            for field in fields {
+                ttl.push_str(&format!("    :hasField \"{}\" ;\n", field));
+                ttl.push_str(&format!("    rdfs:domain :{} .\n\n", name));
             }
         }
 
-        // 2. Generate ABox (JSON-LD)
-        let events_json: String = {
-            let db = state.db.lock();
-            let mut stmt = db.prepare("SELECT payload FROM events ORDER BY received_at DESC LIMIT 100").unwrap();
-            let rows: Vec<String> = stmt.query_map([], |row| {
-                 let json_str: String = row.get(0)?;
-                 Ok(json_str)
-            }).unwrap().map(|r| r.unwrap()).collect();
-            
-            format!("[{}]", rows.join(","))
-        };
-        
+        // 2. Generate ABox (JSON-LD) with proper @context
+        let abox: Vec<serde_json::Value> = schemas_data.iter().flat_map(|(_, _, _, sample)| {
+            serde_json::from_str::<serde_json::Value>(sample).ok()
+        }).collect();
+
+        let abox = serde_json::json!({
+            "@context": ontology_iri,
+            "@type": "@graph",
+            "@graph": abox
+        });
+
         // 3. Payload
         let payload = serde_json::json!({
             "ontology_ttl": ttl,
-            "abox_jsonld": serde_json::from_str::<serde_json::Value>(&events_json).unwrap_or_default(),
-            "exported_at": Local::now().to_rfc3339()
+            "abox_jsonld": abox,
+            "exported_at": Local::now().to_rfc3339(),
+            "event_count": events.len()
         });
 
-        // 4. Send
-        let client = reqwest::Client::new();
-        match client.post(&url).json(&payload).send().await {
-            Ok(_) => println!("✅ Export success"),
-            Err(e) => println!("❌ Export failed: {}", e),
+        // 4. Send with retry logic
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(10))
+            .build()
+            .expect("Failed to build reqwest client");
+        
+        for attempt in 1..=3 {
+            match client.post(&url).json(&payload).send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    info!("✅ Export success");
+                    let mut m = state.metrics.lock();
+                    m.exports_succeeded += events.len();
+                    m.last_export_at = Some(Local::now().to_rfc3339());
+                    break;
+                }
+                Ok(resp) => {
+                    warn!("Export attempt {} failed: HTTP {}", attempt, resp.status());
+                }
+                Err(e) => {
+                    warn!("Export attempt {} failed: {}", attempt, e);
+                }
+            }
+            if attempt < 3 {
+                tokio::time::sleep(Duration::from_secs(2_u64.pow(attempt as u32))).await;
+            }
         }
     }
 }
+
 
 async fn ingest_handler(
     State(state): State<Arc<AppState>>,
@@ -257,39 +364,83 @@ async fn ingest_handler(
 ) -> impl IntoResponse {
     let db = state.db.lock();
     let mut schemas = state.schemas.write();
-
+    
+    // 1. Parse as structured payload
+    let parsed: IngestPayload = match serde_json::from_value(payload.clone()) {
+        Ok(p) => p,
+        Err(_) => {
+            error!("Failed to parse ingest payload");
+            return Html("<div class='text-red-500'>Invalid payload</div>".into());
+        }
+    };
+    
     // 1. Analyze: What is this?
-    let type_name = payload.get("type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("UnknownEvent")
-        .to_string();
+    let type_name = parsed.event_type.unwrap_or_else(|| "UnknownEvent".into());
 
-    // 1.5 React: Dynamic Configuration
+    // 1.5 Update metrics
+    {
+        let mut m = state.metrics.lock();
+        m.events_ingested += 1;
+    }
+
+    // 1.6 React: Dynamic Configuration
     if type_name == "SystemConfig" {
         let mut config = state.config.write();
-        if let Some(url) = payload.get("webhook_url").and_then(|v| v.as_str()) {
-             config.webhook_url = Some(url.to_string());
-             println!("🔗 Webhook updated: {}", url);
+        let mut updated = false;
+        
+        if let Some(url) = parsed.webhook_url {
+            config.webhook_url = Some(url.clone());
+            info!("🔗 Webhook updated: {}", url);
+            updated = true;
         }
-        if let Some(iri) = payload.get("ontology_iri").and_then(|v| v.as_str()) {
-             config.ontology_iri = iri.to_string();
-             println!("🧠 Ontology IRI updated: {}", iri);
+        if let Some(iri) = parsed.ontology_iri {
+            config.ontology_iri = iri.clone();
+            info!("🧠 Ontology IRI updated: {}", iri);
+            updated = true;
+        }
+        
+        if updated {
+            return Html("<div class='text-yellow-400'>Configuration updated</div>".into());
         }
     }
 
     // 2. Persist: Write to DuckDB
     let now = Local::now().to_rfc3339();
-    db.execute(
+    if let Err(e) = db.execute(
         "INSERT INTO events (type, payload, received_at) VALUES (?, ?, ?)",
-        params![type_name, serde_json::to_string(&payload).unwrap(), now],
-    ).unwrap();
+        params![&type_name, serde_json::to_string(&payload).unwrap(), &now],
+    ) {
+        error!("Failed to persist event: {}", e);
+        return Html("<div class='text-red-500'>Database error</div>".into());
+    }
 
     // 3. Learn: Update Schema Registry
     // If this is a new event or has new fields, we update our "Brain"
+    let schema_was_new = !schemas.contains_key(&type_name);
+    
     learn_schema(&mut schemas, type_name.clone(), &payload);
+    
+    if schema_was_new {
+        let mut m = state.metrics.lock();
+        m.schemas_learned += 1;
+    }
 
-    // 4. Emit: Trigger Export Logic
-    tokio::spawn(perform_export(state.clone()));
+    // 4. Export Strategy: Debounce with queue
+    let payload_str = serde_json::to_string(&payload).unwrap();
+    {
+        let mut queue = state.export_queue.lock();
+        queue.push((type_name.clone(), payload));
+        
+        let config = state.config.read();
+        let should_export = queue.len() >= config.export_batch_size;
+        drop(config);
+        drop(queue);
+
+        if should_export {
+            tokio::spawn(perform_export(state.clone()));
+        }
+    }
+
 
     // 5. Notify UI (HTMX Out-of-Band Swap)
     // This pushes the log to the browser without a refresh!
@@ -300,11 +451,77 @@ async fn ingest_handler(
                 <div class="text-gray-500 truncate">{}</div>
             </div>
            </div>"#, 
-        type_name, serde_json::to_string(&payload).unwrap()
+        type_name, payload_str
     );
 
     Html(html)
 }
+
+async fn config_handler(
+    State(state): State<Arc<AppState>>,
+    Form(input): Form<HashMap<String, String>>,
+) -> Html<String> {
+    let mut config = state.config.write();
+    let mut updated = false;
+
+    if let Some(url) = input.get("webhook_url").filter(|s| !s.is_empty()) {
+        config.webhook_url = Some(url.clone());
+        info!("🔗 Webhook updated via UI: {}", url);
+        updated = true;
+    }
+
+    if let Some(iri) = input.get("ontology_iri").filter(|s| !s.is_empty()) {
+        config.ontology_iri = iri.clone();
+        info!("🧠 Ontology IRI updated via UI: {}", iri);
+        updated = true;
+    }
+
+    if let Some(batch) = input.get("batch_size").and_then(|s| s.parse().ok()) {
+        config.export_batch_size = batch;
+        info!("📦 Batch size updated: {}", batch);
+        updated = true;
+    }
+
+    // Reload state and render
+    let session = state.session.lock();
+    let schemas = state.schemas.read();
+    
+    let config_status = format!(
+        r#"Webhook: {} | IRI: {} | Batch: {} {}"#,
+        config.webhook_url.as_deref().unwrap_or("Not set"),
+        config.ontology_iri,
+        config.export_batch_size,
+        if updated { "(updated)" } else { "" }
+    );
+
+    render_full_ui(&session, &schemas, &config_status)
+}
+
+async fn health_handler() -> impl IntoResponse {
+    (axum::http::StatusCode::OK, "OK")
+}
+
+async fn metrics_handler(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+
+    let m = state.metrics.lock();
+    let q = state.export_queue.lock();
+    let config = state.config.read();
+    
+    let json = serde_json::json!({
+        "events_ingested": m.events_ingested,
+        "schemas_learned": m.schemas_learned,
+        "exports_attempted": m.exports_attempted,
+        "exports_succeeded": m.exports_succeeded,
+        "exports_failed": m.exports_failed,
+        "last_export_at": m.last_export_at,
+        "pending_exports": q.len(),
+        "webhook_configured": config.webhook_url.is_some(),
+        "export_batch_size": config.export_batch_size,
+    });
+    
+    axum::Json(json)
+}
+
 
 // =================================================================================
 // 5. THE AGENT (The Chat Logic)
@@ -488,7 +705,14 @@ async fn chat_handler(
 
     let schemas = state.schemas.read();
     let session = state.session.lock();
-    render_full_ui(&session, &schemas)
+    let config = state.config.read();
+    let config_status = format!(
+        r#"Webhook: {} | IRI: {} | Batch: {}"#,
+        config.webhook_url.as_deref().unwrap_or("Not set"),
+        config.ontology_iri,
+        config.export_batch_size
+    );
+    render_full_ui(&session, &schemas, &config_status)
 }
 
 // =================================================================================
@@ -500,10 +724,17 @@ async fn chat_handler(
 async fn ui_handler(State(state): State<Arc<AppState>>) -> Html<String> {
     let session = state.session.lock();
     let schemas = state.schemas.read();
-    render_full_ui(&session, &schemas)
+    let config = state.config.read();
+    let config_status = format!(
+        r#"Webhook: {} | IRI: {} | Batch: {}"#,
+        config.webhook_url.as_deref().unwrap_or("Not set"),
+        config.ontology_iri,
+        config.export_batch_size
+    );
+    render_full_ui(&session, &schemas, &config_status)
 }
 
-fn render_full_ui(session: &SessionState, schemas: &HashMap<String, LearnedSchema>) -> Html<String> {
+fn render_full_ui(session: &SessionState, schemas: &HashMap<String, LearnedSchema>, config_status: &str) -> Html<String> {
     // 1. Render Chat
     let mut chat_html = String::new();
     for (role, content) in &session.history {
@@ -543,11 +774,13 @@ fn render_full_ui(session: &SessionState, schemas: &HashMap<String, LearnedSchem
     let output = HTML_TEMPLATE
         .replace("{{ CHAT_HISTORY }}", &chat_html)
         .replace("{{ SCHEMA_VISUALIZATION }}", &brain_html)
+        .replace("{{ CONFIG_STATUS }}", config_status)
         .replace("id=\"app-root\"", ""); // cleanup
-
+    
     // We wrap the whole thing in a div active for HTMX swapping
     Html(format!("<div id='app-root'>{}</div>", output))
 }
+
 
 #[cfg(test)]
 mod tests {
