@@ -1,5 +1,12 @@
 # ⚡ Master One-File Event Gateway
 
+[![CI](https://github.com/josaum/zero-shot-gateaway/actions/workflows/ci.yml/badge.svg)](https://github.com/josaum/zero-shot-gateaway/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![GitHub repo size](https://img.shields.io/github/repo-size/josaum/zero-shot-gateaway)](https://github.com/josaum/zero-shot-gateaway)
+[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange)](https://www.rust-lang.org)
+[![Code Style](https://img.shields.io/badge/code__style-rustfmt-blue)](https://github.com/rust-lang/rustfmt)
+
+
 > **The "God Node" of Event Processing**: A single Rust binary that acts as an Ingestion Engine, OLAP Database, AI Agent, and Formal Ontology Reasoner.
 
 This project demonstrates a radical **"One-File"** architecture where a highly capable agentic system is contained within a single `main.rs`, integrating:
