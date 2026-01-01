@@ -2,7 +2,7 @@
 
 > **The "God Node" of Event Processing**: A single Rust binary that acts as an Ingestion Engine, OLAP Database, AI Agent, and Formal Ontology Reasoner.
 
-This project demonstrates a radical "One-File" architecture where a highly capable agentic system is contained within a single `main.rs`, integrating:
+This project demonstrates a radical **"One-File"** architecture where a highly capable agentic system is contained within a single `main.rs`, integrating:
 *   **Rust (Axum)**: High-performance async web server.
 *   **DuckDB**: Embedded analytical database (OLAP).
 *   **OpenAI (GPT-4o)**: Strict JSON intent detection and slot filling.
@@ -54,6 +54,24 @@ Once running, open your browser to: **`http://127.0.0.1:9382`**
 - **Config**: `POST http://127.0.0.1:9382/config`
 - **Health**: `GET http://127.0.0.1:9382/health`
 - **Metrics**: `GET http://127.0.0.1:9382/metrics`
+
+---
+
+## 📂 Project Structure
+
+```
+/
+├── src/main.rs           # 🧠 THE BRAIN: All logic, UI, and DB code.
+├── Cargo.toml            # Dependencies
+├── AGENTS.md             # Developer guide & commands
+├── README.md             # This file
+├── llms.txt              # AI Context file
+├── LICENSE               # MIT License
+└── .github/workflows     # CI Pipeline
+```
+
+> [!IMPORTANT]
+> **One-File Rule**: All application logic MUST remain in `src/main.rs`. Do not refactor into modules. This is a purposeful architectural constraint.
 
 ---
 
@@ -153,3 +171,31 @@ curl http://127.0.0.1:9382/metrics
     - `RwLock` protects the Schema Registry for high-concurrency reads.
 - **Export Strategy**: Events are queued and exported in batches. Failed exports are retried 3 times with exponential backoff.
 - **Strict JSON**: We use OpenAI's `response_format: { type: "json_schema", ... }` to ensure the LLM *always* responds with valid machine-readable JSON, eliminating parsing errors.
+
+---
+
+## ❓ Troubleshooting
+
+### Port 9382 in use
+If you see `Os { code: 48, kind: AddrInUse, message: "Address already in use" }`:
+1. Check if another instance is running.
+2. Kill the process occupying port 9382:
+   ```bash
+   lsof -i :9382
+   kill -9 <PID>
+   ```
+
+### Linker Errors
+If you experience linker errors on macOS, ensure you have the command line tools installed:
+```bash
+xcode-select --install
+```
+
+---
+
+## 👥 Contributing
+
+1. **Keep it One-File**: Do not split `src/main.rs`.
+2. **Format Code**: Run `cargo fmt` before committing.
+3. **Check Clippy**: Run `cargo clippy`.
+4. **Test**: Run `cargo test`.

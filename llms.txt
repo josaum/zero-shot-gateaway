@@ -11,14 +11,23 @@ A single-file Rust event gateway that combines:
 ## File Structure
 ```
 /
-├── src/main.rs          # Single-file implementation (all code here)
+├── src/main.rs          # 🧠 THE BRAIN: All logic, UI, and DB code. (Strictly One-File)
 ├── Cargo.toml           # Dependencies
-├── AGENTS.md           # Build/lint/test commands & conventions
-├── README.md           # User-facing documentation
-├── llms.txt            # This file (for AI assistants)
-├── LICENSE             # MIT License
-└── .github/workflows/ci.yml  # CI pipeline
+├── AGENTS.md            # Build/lint/test commands & conventions
+├── README.md            # User-facing documentation
+├── llms.txt             # This file (for AI assistants)
+├── LICENSE              # MIT License
+└── .github/workflows    # CI pipeline
 ```
+
+## System Constraints (CRITICAL)
+1.  **One-File Architecture**: All application logic MUST remain in `src/main.rs`. Do not suggest refactoring into modules.
+2.  **Concurrency**: Use `Arc<AppState>` with `parking_lot` primitives. `RwLock` for read-heavy components (Schema Registry), `Mutex` for write-heavy (DuckDB, Session).
+3.  **Strict JSON**: Interfacing with LLMs must use `response_format: { type: "json_schema" }` to guarantee valid structure.
+4.  **Zero-Build Frontend**: Use HTMX and Tailwind (CDN or embedded) for UI. No Node.js build steps.
+
+## Agent Persona
+You are an expert Rust systems engineer specializing in high-performance, async architectures. You respect architectural constraints (like "One-File") as creative challenges, not limitations. You prioritize type safety, zero-cost abstractions, and effective error handling.
 
 ## Dependencies
 ```toml
@@ -41,18 +50,8 @@ cargo build --release    # Optimized build
 cargo check              # Type checking
 cargo clippy             # Linting
 cargo test               # Run tests
-cargo test -- <pattern>  # Run matching tests
 cargo run                # Run development server on port 9382
 ```
-
-## Code Style (One-File Architecture)
-- **ALL code** must remain in `src/main.rs` unless explicitly instructed otherwise
-- Use `snake_case` for variables/functions
-- Use `PascalCase` for structs/enums
-- Group imports: std → external crates
-- Prefer `Arc<AppState>` with `parking_lot::Mutex` or `RwLock` for shared state
-- Use `Result` for fallible operations; prefer `?` operator
-- Keep handler logic focused; extract pure functions for testing
 
 ## Key Patterns
 
@@ -86,24 +85,3 @@ struct AppState {
 - Uses OpenAI Structured Outputs (`response_format: { type: "json_schema", ... }`)
 - Schema defines: intent, slots, message
 - Strict mode ensures valid JSON responses
-
-## Routes
-| Method | Path | Handler |
-|--------|------|---------|
-| GET | / | ui_handler |
-| POST | /ingest | ingest_handler |
-| POST | /chat | chat_handler |
-| POST | /config | config_handler |
-| GET | /health | health_handler |
-| GET | /metrics | metrics_handler |
-
-## Testing
-- Unit tests in `#[cfg(test)] mod tests` at end of file
-- Test pure functions: `learn_schema`, `check_missing_slots`
-- Tests must not require external services (LLM, database)
-
-## Important Notes
-- Set `OPENAI_API_KEY` environment variable before running
-- Webhook URL and batch size configurable at runtime
-- Exports include full ontology (TTL) and recent events (JSON-LD)
-- UI updates via HTMX out-of-band swaps for real-time experience
