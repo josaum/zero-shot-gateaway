@@ -5,58 +5,97 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Test Commands
 
 ```bash
-cargo build --release    # Recommended for TUI performance
-cargo run --release      # Run the TUI Gateway
-cargo check              # Type checking only
-cargo clippy             # Lint with warnings
-cargo fmt                # Format code
-curl -X POST ...         # Use curl to trigger ingestion/chat API
+# Build and run with ONNX Runtime support
+DYLD_LIBRARY_PATH="/opt/homebrew/lib" cargo run --release
+
+# Headless mode (no TUI)
+DYLD_LIBRARY_PATH="/opt/homebrew/lib" cargo run --release -- --no-tui
+
+# Python consumer
+python consumer.py --follow    # Real-time monitoring
+python consumer.py --batch 100 # Batch processing
+python consumer.py --pytorch   # PyTorch tensor output
+
+# Standard Rust commands
+cargo check             # Type checking
+cargo clippy            # Lint
+cargo fmt               # Format
 ```
 
-## Critical Constraint: TUI & Arrow Architecture
+## Architecture Overview
 
-1.  **TUI-First**: The primary interface is the Terminal (`ratatui`). Visual updates must be efficient.
-2.  **Arrow IPC**: We use **Zero-Copy** rendering. `tui.rs` consumes `arrow::record_batch::RecordBatch` directly from DuckDB. Do not introduce intermediate structs for event data display if possible.
-3.  **Real-time**: Use `tokio::sync::broadcast` for updates. Do not introduce polling loops.
+**Single-binary gateway** combining:
 
-## Architecture
+| Component | File | Technology |
+|-----------|------|------------|
+| API Server | `main.rs` | Axum (port 9382) |
+| Database | `main.rs` | DuckDB + Arrow IPC |
+| Physics Engine | `collider.rs` | Shared Memory + SeqLock |
+| LLM Integration | `main.rs` | LM Studio / OpenAI API |
+| Terminal UI | `tui.rs` | Ratatui |
+| Python Consumer | `consumer.py` | mmap + numpy |
 
-Single-binary gateway combining:
-- **Axum**: Async web server (background, port 9382).
-- **DuckDB**: Embedded OLAP with `vtab-arrow` feature.
-- **Ratatui**: TUI frontend with Vim-like navigation.
-- **Gemini API**: AI intent detection and chat.
-- **Tokio Broadcast**: Internal signaling bus.
+## Key Modules
 
-## Concurrency Pattern
+### `src/collider.rs` — Physics Engine
+- **ParticleFrame**: 4KB aligned struct with semantic embeddings, kinetics, spin
+- **SeqLock Protocol**: Lock-free concurrent read/write
+- **Shared Memory**: `/tmp/cs_physics` (macOS) or `/dev/shm/cs_physics` (Linux)
+- **Embeddings**: Via LM Studio API (`text-embedding-bge-m3@f16`)
 
-```rust
-struct AppState {
-    db: Mutex<Connection>,           // DuckDB (Arrow enabled)
-    schemas: RwLock<HashMap<...>>,   // Schema registry
-    session: Mutex<SessionState>,    // Chat session
-    tx_notify: broadcast::Sender<()>, // Real-time signal
-    // ...
-}
+### `src/main.rs` — Gateway Core
+- **LLM Integration**: `call_llm()` calls LM Studio with thinking-model support
+- **strip_thinking_chain()**: Extracts JSON from `<think>...</think>` output
+- **ingest_handler()**: Processes events → LLM → Physics Engine → DuckDB
+
+### `consumer.py` — Python Consumer
+- **PhysicsConsumer**: Memory-mapped reader with SeqLock
+- **PyTorchConsumer**: Returns `torch.Tensor` directly
+- **Modes**: `--follow`, `--batch N`, `--pytorch`
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LLM_BASE_URL` | `http://192.168.0.141:1234/v1` | LM Studio endpoint |
+| `DYLD_LIBRARY_PATH` | — | ONNX Runtime path (macOS) |
+
+## Critical Constraints
+
+1. **Zero-Copy Philosophy**: Data flows without serialization
+   - DuckDB → Arrow RecordBatch → TUI (no structs)
+   - Physics Engine → Shared Memory → Python numpy (no copies)
+
+2. **Lock-Free Reads**: SeqLock allows Python to read while Rust writes
+
+3. **Thinking Model Support**: Parser handles `<think>` tags automatically
+
+## Data Flow
+
 ```
-
-## Key Flows
-
-**Ingestion**: 
-`POST /ingest` → Parse → Persist DuckDB → `tx_notify.send()` → Ack
-
-**TUI Update**: 
-`tokio::select!` → `rx_notify.recv()` → `db.query_arrow()` → `term.draw()`
-
-**AI Chat**: 
-TUI Input → `POST /api/chat` → Gemini API → Intent/Slots → Response → Broadcast
-
-## Environment
-
-Requires `GEMINI_API_KEY` in `.env`.
+POST /ingest
+     │
+     ▼
+┌─────────────┐    ┌─────────────┐    ┌─────────────┐
+│ LLM Studio  │───▶│  DuckDB     │───▶│ tx_notify   │
+│ (intent)    │    │ (persist)   │    │ (broadcast) │
+└─────────────┘    └─────────────┘    └─────────────┘
+     │                                       │
+     ▼                                       ▼
+┌─────────────┐                      ┌─────────────┐
+│  Collider   │                      │    TUI      │
+│ (smash)     │                      │  (refresh)  │
+└─────────────┘                      └─────────────┘
+     │
+     ▼
+┌─────────────┐    ┌─────────────┐
+│ Shared Mem  │───▶│   Python    │
+│ /tmp/...    │    │  consumer   │
+└─────────────┘    └─────────────┘
+```
 
 ## Code Style
 
-- `snake_case` for variables/functions.
-- `tui.rs`: Handles all rendering and usage input.
-- `main.rs`: Handles API routes, database wiring, and state.
+- `snake_case` for variables/functions
+- Keep `main.rs` as the orchestration layer
+- Heavy logic goes into dedicated modules (`collider.rs`, `tui.rs`)

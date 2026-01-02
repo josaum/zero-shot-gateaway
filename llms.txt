@@ -1,49 +1,84 @@
-# LLMs.txt - One-File Event Gateway (TUI Edition)
+# LLMs.txt - One-File Event Gateway + Physics Engine
 
 ## Project Overview
-A single-binary Rust application serving as a high-performance Event Gateway with a Terminal User Interface (TUI).
+A single-binary Rust application serving as a high-performance Event Gateway with Zero-Copy ML streaming.
+
+**Stack:**
 - **Core**: Rust + Axum + Tokio
-- **Database**: DuckDB with Arrow integration
-- **UI**: Ratatui (Terminal UI)
-- **AI**: Gemini API for chat and intent detection
+- **Database**: DuckDB + Arrow IPC
+- **AI**: LM Studio (OpenAI-compatible, local)
+- **Physics Engine**: Shared Memory + SeqLock
+- **UI**: Ratatui (Terminal)
+- **Consumer**: Python + NumPy/PyTorch
 
 ## File Structure
 ```
 /
-├── src/main.rs          # BACKEND: API routes, DB setup, State, AI Logic
-├── src/tui.rs           # FRONTEND: Ratatui rendering, Input handling, Arrow processing
-├── Cargo.toml           # Dependencies (duckdb + vtab-arrow)
-├── README.md            # Documentation
-└── .env                 # API Keys
+├── src/main.rs          # API, DuckDB, LLM integration
+├── src/collider.rs      # Physics Engine: SharedMem, SeqLock, embeddings
+├── src/tui.rs           # Ratatui terminal UI
+├── consumer.py          # Python zero-copy consumer
+├── Cargo.toml           # Dependencies
+└── .env                 # LLM_BASE_URL config
 ```
 
 ## System Constraints (CRITICAL)
-1.  **TUI Performance**: The render loop must remain non-blocking. Heavy tasks go to `tokio::spawn`.
-2.  **Zero-Copy Arrow**: Data retrieval for the UI uses `duckdb::Arrow` to fetch `RecordBatch`es directly. Avoid deserializing into `Vec<Struct>` for high-volume event lists.
-3.  **Real-time Signaling**: UI updates are triggered by `tokio::sync::broadcast`, NOT polling.
 
-## Dependencies context
+1. **Zero-Copy Always**: 
+   - DuckDB → Arrow RecordBatch → TUI (no struct conversion)
+   - Physics Engine → mmap → numpy (direct memory access)
+
+2. **Lock-Free Reads**: SeqLock protocol enables concurrent read/write
+
+3. **Thinking Models**: Supports `<think>...</think>` wrapped output (Qwen3, etc.)
+
+4. **Local LLM First**: Default endpoint is LM Studio at `http://192.168.0.141:1234/v1`
+
+## Dependencies
 ```toml
 axum = "0.7"
 tokio = { version = "1", features = ["full"] }
 duckdb = { version = "1.0", features = ["bundled", "vtab-arrow"] }
 ratatui = "0.29"
-crossterm = "0.28"
-reqwest = "0.12"
+reqwest = { version = "0.12", features = ["json", "blocking"] }
+memmap2 = "0.9"
+ort = { version = "2.0.0-rc.9", features = ["load-dynamic"] }
 ```
 
-## Key Patterns
+## Key Components
 
-### TUI Data Flow
-1. API receives Event.
-2. API saves to DuckDB.
-3. API sends signal on `tx_notify` broadcast channel.
-4. TUI background task wakes up, queries DuckDB (Arrow), sends `RecordBatch` to UI thread.
-5. UI thread redraws frame using Arrow columns directly.
+### Physics Engine (collider.rs)
+- **ParticleFrame**: 4KB struct with 1024-dim embedding, kinetics, spin
+- **Ring Buffer**: 100,000 frames in shared memory
+- **SeqLock**: Odd sequence = writing, Even = valid
+- **Embeddings**: Via LM Studio `/embeddings` endpoint (BGE-M3)
 
-### AI Chat Flow
-1. User types in TUI (Edit Mode).
-2. TUI POSTs to local `/api/chat`.
-3. Handler builds context from `AppState.schemas`.
-4. Handler calls Gemini API -> Returns Intent/Slots.
-5. Response displayed in Chat UI.
+### LLM Integration (main.rs)
+- **call_llm()**: Posts to LM Studio `/chat/completions`
+- **strip_thinking_chain()**: Removes `<think>` tags, extracts JSON
+- **LLMResponse**: Optional fields for flexible model support
+
+### Python Consumer (consumer.py)
+- **PhysicsConsumer.follow()**: Generator for real-time frames
+- **PyTorchConsumer**: Direct tensor output
+- **SeqLock validation**: Retry on torn reads
+
+## Data Flow
+
+```
+Event → LLM (intent) → DuckDB → Physics Engine → Shared Memory → Python
+```
+
+## Running
+
+```bash
+# Gateway (macOS)
+DYLD_LIBRARY_PATH="/opt/homebrew/lib" cargo run --release -- --no-tui
+
+# Consumer
+python consumer.py --follow
+
+# Test
+curl -X POST http://localhost:9382/ingest -H "Content-Type: application/json" \
+  -d '{"message": "Test message", "type": "Test"}'
+```
