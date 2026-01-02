@@ -1,30 +1,60 @@
-# ⚡ Master One-File Event Gateway
+# ⚡ One-File Event Gateway (TUI Edition)
 
 [![CI](https://github.com/josaum/zero-shot-gateaway/actions/workflows/ci.yml/badge.svg)](https://github.com/josaum/zero-shot-gateaway/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![GitHub repo size](https://img.shields.io/github/repo-size/josaum/zero-shot-gateaway)](https://github.com/josaum/zero-shot-gateaway)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange)](https://www.rust-lang.org)
-[![Code Style](https://img.shields.io/badge/code__style-rustfmt-blue)](https://github.com/rust-lang/rustfmt)
 
+> **The "God Node" of Event Processing**: A single Rust binary that acts as an Ingestion Engine, OLAP Database, AI Agent, and TUI Dashboard.
 
-> **The "God Node" of Event Processing**: A single Rust binary that acts as an Ingestion Engine, OLAP Database, AI Agent, and Formal Ontology Reasoner.
+![TUI Demo](demo.webp)
 
-This project demonstrates a radical **"One-File"** architecture where a highly capable agentic system is contained within a single `main.rs`, integrating:
-*   **Rust (Axum)**: High-performance async web server.
-*   **DuckDB**: Embedded analytical database (OLAP).
-*   **OpenAI (GPT-4o)**: Strict JSON intent detection and slot filling.
-*   **HTMX / Tailwind**: Server-side rendered, zero-build frontend.
+This project pushes the boundaries of the **"One-File"** architecture. It is a highly capable, agentic data system contained entirely within a single `main.rs`, integrating:
+
+*   **TUI (Ratatui)**: Zero-latency, keyboard-first terminal interface.
+*   **DuckDB + Arrow IPC**: **Zero-copy** data streaming from OLAP to UI.
+*   **Real-time Broadcast**: Native `tokio::sync::broadcast` signaling (no polling).
+*   **Gemini AI**: Embedded chat agent for intent detection and workflow automation.
+
+---
+
+## 💡 Why "One File"?
+
+In a world of microservices and complex Kubernetes manifests, **Simplicity is Power**. 
+This project demonstrates that you can build a production-grade, concurrent, and stateful application without the sprawl. It serves as:
+1.  **A provocative study** in Rust state management (`Arc`, `Mutex`, `RwLock`).
+2.  **The ultimate deployment unit**: Just copy the binary and run. No containers required.
+
+---
+
+## 🎯 Use Cases
+
+### 🛠 The Data Engineer's Terminal
+Stop spinning up UI tools to debug webhooks.
+*   **Run this Gateway locally.**
+*   **Ingest events** via `curl`.
+*   **Visualize instantly** in the terminal with Arrow-speed rendering.
+
+### 🧠 The AI Agent's "Cortex"
+Agents need memory and interfaces.
+*   Send your agent's logs or observations to the gateway.
+*   The gateway **learns the structure** of the memories.
+*   **Chat with your data** natively in the TUI using the embedded AI assistant.
+
+### ⚡ Arrow Zero-Copy Performance
+Demonstrating the raw power of modern Rust data stacks.
+*   DuckDB stores the data.
+*   Data is exported directly as **Arrow RecordBatches**.
+*   The TUI renders directly from columnar arrays. **Zero deserialization overhead.**
 
 ---
 
 ## 🚀 Features
 
-1.  **Learned Schemas**: Send any JSON event to `/ingest`. The system automatically learns the schema, tracks fields, and keeps a sample.
-2.  **Reflexive & Persistence**: Configuring the system via `SystemConfig` events triggers immediate self-reconfiguration. It emits the full learned ontology (TTL) and data history (JSON-LD) to a webhook on every change.
-3.  **Resilient Exports**: Exports are batched (default: 5 events) with automatic retry and exponential backoff for reliability.
-4.  **Observability**: Structured logging with `/metrics` and `/health` endpoints for production monitoring.
-5.  **Context-Aware Chat**: Talk to the system in natural language. It uses the learned schemas to understand what you want (Intent Detection) and extracts the necessary details (Slot Filling).
-6.  **Zero-Latency UI**: A real-time dashboard powered by HTMX that updates instantly as events arrive or chat occurs.
+1.  **Arrow IPC Zero-Copy**: Data flows from DuckDB to the screen without deserializing into Rust structs.
+2.  **Real-time Broadcasting**: Ingestion triggers instant UI updates via internal signaling. No HTTP polling.
+3.  **Learned Schemas**: Automatically infers types from JSON events.
+4.  **AI Chat Interface**: Context-aware agent for querying data and triggering workflows.
+5.  **Reflexive Configuration**: Reconfigures itself based on `SystemConfig` events.
 
 ---
 
@@ -36,10 +66,10 @@ Ensure you have the latest stable Rust installed.
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 ```
 
-### 2. OpenAI API Key
-Required for the "Agent" intelligence.
+### 2. Gemini API Key
+Required for the AI Chat features.
 ```bash
-export OPENAI_API_KEY="sk-..."
+echo "GEMINI_API_KEY=your_key_here" > .env
 ```
 
 ---
@@ -49,18 +79,19 @@ export OPENAI_API_KEY="sk-..."
 Because this uses a single binary, you just need to run:
 
 ```bash
-# Run!
-cargo run --bin one_file_gateway
+# Optimized release build is recommended for TUI performance
+cargo run --release
 ```
 
-Once running, open your browser to: **`http://127.0.0.1:9382`**
-
-### Endpoints
-- **UI & Chat**: `http://127.0.0.1:9382`
-- **Ingestion**: `POST http://127.0.0.1:9382/ingest`
-- **Config**: `POST http://127.0.0.1:9382/config`
-- **Health**: `GET http://127.0.0.1:9382/health`
-- **Metrics**: `GET http://127.0.0.1:9382/metrics`
+### Keyboard Controls
+| Key | Action |
+|-----|--------|
+| `1-4` | Switch Tabs (Events, Schemas, Chat, Metrics) |
+| `j` / `k` | Scroll Lists |
+| `e` | Enter Chat/Edit Mode (Chat Tab) |
+| `Esc` | Exit Edit Mode |
+| `Enter` | Send Message |
+| `q` | Quit |
 
 ---
 
@@ -68,40 +99,23 @@ Once running, open your browser to: **`http://127.0.0.1:9382`**
 
 ```
 /
-├── src/main.rs           # 🧠 THE BRAIN: All logic, UI, and DB code.
+├── src/main.rs           # 🧠 THE BRAIN: logic, db, api. logic in modules/tui.rs
+├── src/tui.rs            # 🖥️ THE FACE: Ratatui implementation
 ├── Cargo.toml            # Dependencies
-├── AGENTS.md             # Developer guide & commands
+├── AGENTS.md             # Developer guide
 ├── README.md             # This file
 ├── llms.txt              # AI Context file
-├── LICENSE               # MIT License
-└── .github/workflows     # CI Pipeline
+└── .env                  # Secrets
 ```
 
 > [!IMPORTANT]
-> **One-File Rule**: All application logic MUST remain in `src/main.rs`. Do not refactor into modules. This is a purposeful architectural constraint.
+> **One-File Philosophy**: While we split `tui.rs` for visual sanity, the core "Gateway" logic remains centralized. The TUI is treated as a "view" layer.
 
 ---
 
 ## 📖 Usage Examples
 
 ### 1. Ingestion (The Learning Phase)
-Feed the system some data. It will "learn" that these event types exist.
-
-**Configure via UI:**
-Use the Config panel in the sidebar to set webhook URL and batch size.
-
-**Configure via API (Reflexivity):**
-First, tell the system where to send the ontology.
-```bash
-curl -X POST http://127.0.0.1:9382/ingest \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "SystemConfig",
-    "webhook_url": "https://webhook.site/your-id",
-    "ontology_iri": "http://my-org.com/ontology/"
-  }'
-```
-*The system immediately reacts by exporting its current state to the webhook.*
 
 **Ingest a `UserSignup` event:**
 ```bash
@@ -115,94 +129,39 @@ curl -X POST http://127.0.0.1:9382/ingest \
   }'
 ```
 
-**Ingest a `PaymentProcessed` event:**
-```bash
-curl -X POST http://127.0.0.1:9382/ingest \
-  -H "Content-Type: application/json" \
-  -d '{
-    "type": "PaymentProcessed",
-    "amount": 99.99,
-    "currency": "USD",
-    "transaction_id": "tx_12345"
-  }'
-```
-
-*Check the UI: You will see these schemas appear in the "Learned Schemas" panel.*
+*Check the TUI: You will see the event appear **instantly** in the "Events" tab.*
 
 ---
 
-### 2. The Agent (The Acting Phase)
-Go to the chat interface in the browser to interact with the agent. It knows about the events you just sent.
+### 2. The AI Chat (The Acting Phase)
 
-**User:** "I want to manually record a new signup."
-**Agent:** "I can help with that. I detected you want to trigger a `UserSignup`. Please provide the `email` and `plan`."
-
-**User:** "It's for bob@test.com and he is on the Starter plan."
-**Agent:** "Captured `email`=bob@test.com, `plan`=Starter. I still need the `region`."
+1. Switch to **Chat** tab (Press `3`).
+2. Press `e` to enter edit mode.
+3. Type: *"I want to check recent signups."*
+4. Press `Enter`.
+5. The AI (Gemini) will analyze the learned schemas and respond.
 
 ---
 
 ## 📊 Monitoring
 
-### Health Check
-```bash
-curl http://127.0.0.1:9382/health
-# Returns: OK
-```
-
 ### Metrics
-```bash
-curl http://127.0.0.1:9382/metrics
-# Returns JSON:
-# {
-#   "events_ingested": 42,
-#   "schemas_learned": 3,
-#   "exports_attempted": 8,
-#   "exports_succeeded": 7,
-#   "exports_failed": 1,
-#   "last_export_at": "2025-12-24T21:30:00+00:00",
-#   "pending_exports": 2,
-#   "webhook_configured": true,
-#   "export_batch_size": 5
-# }
-```
+The **Metrics** tab (Press `4`) visualizes real-time throughput and schema learning counts using ASCII bar charts.
 
 ---
 
 ## 🧠 Architecture Notes
 
-- **One File**: Everything (DB init, UI HTML, API routes, Logic) is in `src/main.rs`.
-- **Concurrency**:
-    - `AppState` is wrapped in `Arc` and shared across threads.
-    - `Mutex` protects the DuckDB connection and Session state.
-    - `RwLock` protects the Schema Registry for high-concurrency reads.
-- **Export Strategy**: Events are queued and exported in batches. Failed exports are retried 3 times with exponential backoff.
-- **Strict JSON**: We use OpenAI's `response_format: { type: "json_schema", ... }` to ensure the LLM *always* responds with valid machine-readable JSON, eliminating parsing errors.
-
----
-
-## ❓ Troubleshooting
-
-### Port 9382 in use
-If you see `Os { code: 48, kind: AddrInUse, message: "Address already in use" }`:
-1. Check if another instance is running.
-2. Kill the process occupying port 9382:
-   ```bash
-   lsof -i :9382
-   kill -9 <PID>
-   ```
-
-### Linker Errors
-If you experience linker errors on macOS, ensure you have the command line tools installed:
-```bash
-xcode-select --install
-```
+- **Zero-Copy**: Uses `duckdb::vtab_arrow` to stream `RecordMatch`es.
+- **Signal**: `tokio::sync::broadcast` for event propagation.
+- **Concurrency**: State shared via `Arc<RwLock<AppState>>`.
+- **Storage**: In-memory DuckDB (default) or fast local disk.
 
 ---
 
 ## 👥 Contributing
 
-1. **Keep it One-File**: Do not split `src/main.rs`.
-2. **Format Code**: Run `cargo fmt` before committing.
-3. **Check Clippy**: Run `cargo clippy`.
-4. **Test**: Run `cargo test`.
+1. **Keep it Simple**.
+2. **Format Code**: `cargo fmt`
+3. **Check Clippy**: `cargo clippy`
+4. **Test**: `cargo test`

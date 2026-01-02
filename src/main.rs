@@ -1,15 +1,22 @@
+use clap::Parser;
+use htmlescape::encode_minimal;
 use axum::{
-    extract::{State, Form, Json},
-    response::{Html, IntoResponse},
+    extract::{Request, State, Json, Path},
+    middleware::{self, Next},
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
+    http::{StatusCode, header::AUTHORIZATION},
 };
 use duckdb::{params, Connection};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::{collections::{HashMap, HashSet}, sync::Arc, env, time::Duration};
 use chrono::Local;
+use tokio::sync::broadcast;
 use tracing::{info, warn, error};
+
+mod tui;
 
 
 // The "Truth" derived from the event stream
@@ -96,6 +103,48 @@ struct AppState {
     export_queue: Mutex<Vec<(String, serde_json::Value)>>,
     // Metrics
     metrics: Mutex<Metrics>,
+    // Auth Token
+    auth_token: Option<String>,
+    // Real-time notification channel
+    tx_notify: broadcast::Sender<()>,
+}
+
+#[derive(Parser, Debug)]
+#[command(author, version, about, long_about = None)]
+struct Args {
+   /// Optional path to a persistent DuckDB file (e.g., ./gateway.db)
+   #[arg(long)]
+   db_path: Option<String>,
+
+   /// Optional Bearer token for securing /ingest and /config
+   #[arg(long)]
+   token: Option<String>,
+
+   /// Run without the Terminal UI (headless mode)
+   #[arg(long)]
+   no_tui: bool,
+}
+
+async fn auth_middleware(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    // If no token is configured, allow everything
+    if state.auth_token.is_none() {
+        return Ok(next.run(req).await);
+    }
+
+    let token = state.auth_token.as_ref().unwrap();
+    let auth_header = req.headers()
+        .get(AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        .and_then(|h| h.strip_prefix("Bearer "));
+
+    match auth_header {
+        Some(t) if t == token => Ok(next.run(req).await),
+        _ => Err(StatusCode::UNAUTHORIZED),
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -108,84 +157,6 @@ struct Metrics {
     last_export_at: Option<String>,
 }
 
-// =================================================================================
-// 2. THE FRONTEND (Embedded HTMX)
-// =================================================================================
-
-const HTML_TEMPLATE: &str = r##"
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>The One-File Gateway</title>
-    <script src="https://unpkg.com/htmx.org@1.9.10"></script>
-    <script src="https://cdn.tailwindcss.com"></script>
-    <style>
-        .fade-in { animation: fadeIn 0.3s ease-in; }
-        @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-    </style>
-</head>
-<body class="bg-gray-900 text-gray-100 h-screen flex overflow-hidden font-mono">
-
-    <div class="w-1/3 border-r border-gray-700 flex flex-col bg-gray-950">
-        <div class="p-4 border-b border-gray-800 bg-gray-900">
-            <h2 class="text-xs font-bold text-gray-500 uppercase tracking-widest">Live Event Stream</h2>
-            <div class="text-xs text-green-500 mt-1">Listening on POST /ingest</div>
-        </div>
-        <div id="event-log" class="flex-1 p-4 overflow-y-auto space-y-2 font-mono text-xs">
-            <div class="text-gray-600 italic">Waiting for data...</div>
-        </div>
-    </div>
-
-    <div class="w-1/3 border-r border-gray-700 flex flex-col relative">
-        <div class="p-4 border-b border-gray-800 bg-gray-900">
-             <h2 class="text-xs font-bold text-blue-500 uppercase tracking-widest">Agent Interface</h2>
-        </div>
-        
-        <div id="chat-feed" class="flex-1 p-4 overflow-y-auto space-y-4">
-            {{ CHAT_HISTORY }}
-        </div>
-
-        <div class="p-4 bg-gray-800">
-            <form hx-post="/chat" hx-target="#app-root" hx-swap="outerHTML" class="flex gap-2">
-                <input type="text" name="msg" autocomplete="off"
-                       class="flex-1 bg-gray-900 border border-gray-600 rounded px-3 py-2 focus:border-blue-500 focus:outline-none transition"
-                       placeholder="Ask to start a workflow..." autofocus>
-                <button type="submit" class="bg-blue-600 hover:bg-blue-500 px-4 py-2 rounded font-bold text-sm">
-                    Send
-                </button>
-            </form>
-            <form hx-post="/config" hx-target="#app-root" hx-swap="outerHTML" class="mt-2 flex gap-2 p-2 bg-gray-900 rounded">
-                <input type="text" name="webhook_url" placeholder="Webhook URL..."
-                       class="flex-1 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs">
-                <input type="number" name="batch_size" placeholder="Batch size" value="5"
-                       class="w-20 bg-gray-800 border border-gray-600 rounded px-2 py-1 text-xs">
-                <button type="submit" class="bg-gray-700 hover:bg-gray-600 px-3 py-1 rounded text-xs">Set Config</button>
-            </form>
-        </div>
-    </div>
-
-    <div class="w-1/3 bg-gray-950 flex flex-col">
-        <div class="p-4 border-b border-gray-800 bg-gray-900">
-             <h2 class="text-xs font-bold text-purple-500 uppercase tracking-widest">Learned Schemas</h2>
-             <div class="text-xs text-gray-600 mt-1">{{ CONFIG_STATUS }}</div>
-        </div>
-        <div class="p-6 space-y-6">
-            {{ SCHEMA_VISUALIZATION }}
-        </div>
-        <div class="p-4 border-t border-gray-800">
-             <h3 class="text-xs font-bold text-yellow-500 uppercase tracking-widest mb-2">Quick Links</h3>
-             <div class="flex gap-2 text-xs">
-                 <a href="/metrics" target="_blank" class="text-blue-400 hover:underline">📊 Metrics</a>
-                 <a href="/health" target="_blank" class="text-green-400 hover:underline">💚 Health</a>
-             </div>
-        </div>
-    </div>
-
-</body>
-</html>
-"##;
 
 // =================================================================================
 // 3. THE LOGIC (Main Loop)
@@ -193,21 +164,38 @@ const HTML_TEMPLATE: &str = r##"
 
 #[tokio::main]
 async fn main() {
+    // Load .env file if it exists (for GEMINI_API_KEY, etc.)
+    let _ = dotenvy::dotenv();
+    
+    let args = Args::parse();
+    let no_tui = args.no_tui;
+
+    // Setup tracing
+    tracing_subscriber::fmt().init();
+    info!("⚡ MASTER ONE-FILE ACTIVE");
 
     // A. Initialize the "Cortex" (DuckDB)
-    let conn = Connection::open_in_memory().expect("Failed to open DuckDB");
+    let conn = if let Some(path) = &args.db_path {
+        info!("📂 Opening persistent database at: {}", path);
+        Connection::open(path).expect("Failed to open DuckDB")
+    } else {
+        info!("⚠️  Using IN-MEMORY database (Data will be lost on exit)");
+        Connection::open_in_memory().expect("Failed to open DuckDB")
+    };
     
     // Create a flexible table for raw logs
+    // We use IF NOT EXISTS now because the DB might persist
     conn.execute(
-        "CREATE TABLE events (type VARCHAR, payload JSON, received_at TIMESTAMP)",
+        "CREATE TABLE IF NOT EXISTS events (type VARCHAR, payload JSON, received_at TIMESTAMP)",
         params![],
     ).expect("Failed to create table");
 
+    let (tx_notify, _) = broadcast::channel(100);
     let state = Arc::new(AppState {
         db: Mutex::new(conn),
         schemas: RwLock::new(HashMap::new()),
         session: Mutex::new(SessionState {
-            history: vec![("System".into(), "System Online. Waiting for event stream...".into())],
+            history: vec![("System".into(), "Gateway initialized. Listening for events...".into())],
             active_intent: None,
             collected_slots: HashMap::new(),
         }),
@@ -219,11 +207,9 @@ async fn main() {
         }),
         export_queue: Mutex::new(Vec::new()),
         metrics: Mutex::new(Metrics::default()),
+        auth_token: args.token,
+        tx_notify: tx_notify.clone(),
     });
-
-    // Setup tracing
-    tracing_subscriber::fmt().init();
-    info!("⚡ MASTER ONE-FILE ACTIVE");
 
     // Graceful shutdown signal handler
     tokio::spawn(async move {
@@ -232,24 +218,46 @@ async fn main() {
     });
 
     // B. Build the Router
-    let app = Router::new()
-        .route("/", get(ui_handler))
-        .route("/chat", post(chat_handler))
+    // 1. Protected Routes (Ingest & Config)
+    let protected = Router::new()
+        .route("/api/events", get(list_events_handler))
+        .route("/api/schemas", get(list_schemas_handler))
+        .route("/api/schemas/:name", get(get_schema_handler))
         .route("/ingest", post(ingest_handler))
-        .route("/config", post(config_handler))
+        .route("/api/config", post(config_handler))
+        .route_layer(middleware::from_fn_with_state(state.clone(), auth_middleware));
+
+    // 2. Public Routes & Merge
+    let app = Router::new()
+        .route("/api/chat", post(chat_handler))
         .route("/health", get(health_handler))
         .route("/metrics", get(metrics_handler))
+        .merge(protected)
+        .with_state(state.clone());
 
-        .with_state(state);
+    // Spawn API server in background
+    tokio::spawn(async move {
+        info!("   > API Server: http://127.0.0.1:9382");
+        info!("   > Ingestion: POST http://127.0.0.1:9382/ingest");
+        info!("   > Chat: POST http://127.0.0.1:9382/api/chat");
+        info!("   > Health: GET http://127.0.0.1:9382/health");
+        info!("   > Metrics: GET http://127.0.0.1:9382/metrics");
+        
+        let listener = tokio::net::TcpListener::bind("0.0.0.0:9382").await.unwrap();
+        axum::serve(listener, app).await.unwrap();
+    });
 
-    info!("   > UI & Chat: http://127.0.0.1:9382");
-    info!("   > Ingestion: POST http://127.0.0.1:9382/ingest");
-    info!("   > Config: POST http://127.0.0.1:9382/config");
-    info!("   > Health: GET http://127.0.0.1:9382/health");
-    info!("   > Metrics: GET http://127.0.0.1:9382/metrics");
-
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:9382").await.unwrap();
-    axum::serve(listener, app).await;
+    // Run TUI in foreground (or wait in headless mode)
+    if no_tui {
+        info!("🚀 Running in headless mode (use --help for TUI mode)");
+        // Wait forever
+        std::future::pending::<()>().await;
+    } else {
+        info!("🖥️  Launching Terminal UI...");
+        if let Err(e) = tui::run_tui(state).await {
+            error!("TUI error: {}", e);
+        }
+    }
 }
 
 // =================================================================================
@@ -262,6 +270,8 @@ struct IngestPayload {
     event_type: Option<String>,
     webhook_url: Option<String>,
     ontology_iri: Option<String>,
+    #[serde(flatten)]
+    payload: HashMap<String, serde_json::Value>,
 }
 
 async fn perform_export(state: Arc<AppState>) {
@@ -358,32 +368,47 @@ async fn perform_export(state: Arc<AppState>) {
 }
 
 
+
 async fn ingest_handler(
     State(state): State<Arc<AppState>>,
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
-    let db = state.db.lock();
-    let mut schemas = state.schemas.write();
-    
-    // 1. Parse as structured payload
+    // 1. Parsing
     let parsed: IngestPayload = match serde_json::from_value(payload.clone()) {
         Ok(p) => p,
         Err(_) => {
             error!("Failed to parse ingest payload");
-            return Html("<div class='text-red-500'>Invalid payload</div>".into());
+            return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error": "Invalid payload"}))).into_response();
         }
     };
     
-    // 1. Analyze: What is this?
-    let type_name = parsed.event_type.unwrap_or_else(|| "UnknownEvent".into());
+    // 2. AI Enrichment
+    let mut type_name = parsed.event_type.clone().unwrap_or_else(|| "UnknownEvent".into());
+    
+    if type_name == "UnknownEvent" {
+        let payload_str_for_llm = serde_json::to_string(&parsed.payload).unwrap_or_default();
+        let system_prompt = "You are an intelligent data intake agent. Analyze the provided JSON webhook payload and infer a concise, PascalCase EventType name (e.g., 'UserSignup', 'GitHubPush', 'WhatsAppMessage'). Return it in the 'intent' field. If unsure, use 'GenericWebhook'.";
+        
+        match call_llm(&payload_str_for_llm, system_prompt).await {
+            Ok(ur) => {
+                if let Some(inferred) = ur.intent {
+                    info!("🤖 Gemini inferred event type: {} -> {}", type_name, inferred);
+                    type_name = inferred;
+                }
+            },
+            Err(e) => {
+                warn!("⚠️ LLM inference failed: {}", e);
+            }
+        }
+    }
 
-    // 1.5 Update metrics
+    // 2.5 Metrics
     {
         let mut m = state.metrics.lock();
         m.events_ingested += 1;
     }
 
-    // 1.6 React: Dynamic Configuration
+    // 2.6 Dynamic Config
     if type_name == "SystemConfig" {
         let mut config = state.config.write();
         let mut updated = false;
@@ -400,79 +425,76 @@ async fn ingest_handler(
         }
         
         if updated {
-            return Html("<div class='text-yellow-400'>Configuration updated</div>".into());
+            return (StatusCode::OK, Json(serde_json::json!({"status": "configuration_updated"}))).into_response();
         }
     }
 
-    // 2. Persist: Write to DuckDB
+    // 3. Persist
     let now = Local::now().to_rfc3339();
-    if let Err(e) = db.execute(
-        "INSERT INTO events (type, payload, received_at) VALUES (?, ?, ?)",
-        params![&type_name, serde_json::to_string(&payload).unwrap(), &now],
-    ) {
-        error!("Failed to persist event: {}", e);
-        return Html("<div class='text-red-500'>Database error</div>".into());
+    let payload_str = serde_json::to_string(&payload).unwrap_or_default();
+    
+    {
+        let db = state.db.lock();
+        if let Err(e) = db.execute(
+            "INSERT INTO events (type, payload, received_at) VALUES (?, ?, ?)",
+            params![&type_name, &payload_str, &now],
+        ) {
+            error!("Failed to persist event: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({"error": "Database error"}))).into_response();
+        }
     }
 
-    // 3. Learn: Update Schema Registry
-    // If this is a new event or has new fields, we update our "Brain"
-    let schema_was_new = !schemas.contains_key(&type_name);
-    
-    learn_schema(&mut schemas, type_name.clone(), &payload);
+    // 4. Learn
+    let schema_was_new; 
+    {
+        let mut schemas = state.schemas.write();
+        schema_was_new = !schemas.contains_key(&type_name);
+        learn_schema(&mut schemas, type_name.clone(), &payload);
+    }
     
     if schema_was_new {
         let mut m = state.metrics.lock();
         m.schemas_learned += 1;
     }
 
-    // 4. Export Strategy: Debounce with queue
-    let payload_str = serde_json::to_string(&payload).unwrap();
+    // 5. Export
     {
         let mut queue = state.export_queue.lock();
         queue.push((type_name.clone(), payload));
         
         let config = state.config.read();
         let should_export = queue.len() >= config.export_batch_size;
-        drop(config);
-        drop(queue);
-
+        drop(config); 
+        
         if should_export {
-            tokio::spawn(perform_export(state.clone()));
+            let state_clone = state.clone();
+            tokio::spawn(perform_export(state_clone));
         }
     }
 
+    // 6. Notify TUI
+    let _ = state.tx_notify.send(());
 
-    // 5. Notify UI (HTMX Out-of-Band Swap)
-    // This pushes the log to the browser without a refresh!
-    let html = format!(
-        r#"<div id="event-log" hx-swap-oob="afterbegin">
-            <div class="mb-2 p-2 bg-gray-900 rounded border border-gray-700 fade-in">
-                <div class="text-green-400 font-bold">{}</div>
-                <div class="text-gray-500 truncate">{}</div>
-            </div>
-           </div>"#, 
-        type_name, payload_str
-    );
-
-    Html(html)
+    // 7. Return Success
+    (StatusCode::OK, Json(serde_json::json!({"status": "received", "event_type": type_name}))).into_response()
 }
 
 async fn config_handler(
     State(state): State<Arc<AppState>>,
-    Form(input): Form<HashMap<String, String>>,
-) -> Html<String> {
+    Json(input): Json<HashMap<String, String>>,
+) -> Json<serde_json::Value> {
     let mut config = state.config.write();
     let mut updated = false;
 
     if let Some(url) = input.get("webhook_url").filter(|s| !s.is_empty()) {
         config.webhook_url = Some(url.clone());
-        info!("🔗 Webhook updated via UI: {}", url);
+        info!("🔗 Webhook updated via API: {}", url);
         updated = true;
     }
 
     if let Some(iri) = input.get("ontology_iri").filter(|s| !s.is_empty()) {
         config.ontology_iri = iri.clone();
-        info!("🧠 Ontology IRI updated via UI: {}", iri);
+        info!("🧠 Ontology IRI updated via API: {}", iri);
         updated = true;
     }
 
@@ -482,19 +504,65 @@ async fn config_handler(
         updated = true;
     }
 
-    // Reload state and render
-    let session = state.session.lock();
-    let schemas = state.schemas.read();
-    
-    let config_status = format!(
-        r#"Webhook: {} | IRI: {} | Batch: {} {}"#,
-        config.webhook_url.as_deref().unwrap_or("Not set"),
-        config.ontology_iri,
-        config.export_batch_size,
-        if updated { "(updated)" } else { "" }
-    );
+    Json(serde_json::json!({
+        "status": if updated { "updated" } else { "unchanged" },
+        "config": {
+            "webhook_url": config.webhook_url,
+            "ontology_iri": config.ontology_iri,
+            "export_batch_size": config.export_batch_size
+        }
+    }))
+}
 
-    render_full_ui(&session, &schemas, &config_status)
+async fn list_schemas_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let schemas = state.schemas.read();
+    let list: Vec<_> = schemas.values().map(|s| {
+        serde_json::json!({
+            "name": s.name,
+            "fields": s.fields,
+            "sample": s.sample_data,
+            "context": s.jsonld_context
+        })
+    }).collect();
+    Json(serde_json::json!({ "schemas": list }))
+}
+
+async fn get_schema_handler(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+) -> impl IntoResponse {
+    let schemas = state.schemas.read();
+    if let Some(schema) = schemas.get(&name) {
+        (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "name": schema.name,
+                "fields": schema.fields,
+                "sample": schema.sample_data,
+                "context": schema.jsonld_context
+            }))
+        ).into_response()
+    } else {
+        (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({ "error": "Schema not found" }))
+        ).into_response()
+    }
+}
+
+async fn list_events_handler(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let db = state.db.lock();
+    let mut stmt = db.prepare("SELECT type, payload, received_at FROM events ORDER BY received_at DESC LIMIT 50").unwrap();
+    let events_iter = stmt.query_map([], |row| {
+        Ok(serde_json::json!({
+            "type": row.get::<_, String>(0)?,
+            "payload": row.get::<_, String>(1)?,
+            "received_at": row.get::<_, String>(2)?,
+        }))
+    }).unwrap();
+
+    let events: Vec<_> = events_iter.map(|r| r.unwrap()).collect();
+    Json(serde_json::json!({ "events": events }))
 }
 
 async fn health_handler() -> impl IntoResponse {
@@ -547,81 +615,93 @@ async fn call_llm(
     input: &str,
     system_prompt: &str
 ) -> Result<LLMResponse, String> {
-    let api_key = env::var("OPENAI_API_KEY").map_err(|_| "OPENAI_API_KEY not set")?;
-    let client = reqwest::Client::new();
+    // 1. Get Key
+    let api_key = env::var("GEMINI_API_KEY").map_err(|_| "GEMINI_API_KEY not set")?;
     
-    // strict: true requires additionalProperties: false on all objects
-    let schema = serde_json::json!({
-        "name": "gateway_response",
-        "strict": true,
-        "schema": {
-            "type": "object",
-            "properties": {
-                "intent": {
-                    "type": ["string", "null"],
-                    "description": "The name of the schema if an intent is detected, or null."
-                },
-                "slots": {
-                    "type": "array",
-                    "description": "Any extracted entity values.",
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "name": { "type": "string" },
-                            "value": { "type": "string" }
-                        },
-                        "required": ["name", "value"],
-                        "additionalProperties": false
-                    }
-                },
-                "message": {
-                    "type": "string",
-                    "description": "Response message to the user."
+    // 2. Prepare Client
+    let client = reqwest::Client::new();
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/gemini-3-flash-preview:generateContent?key={}", 
+        api_key
+    );
+
+    // 3. Define Schema for Gemini Structured Output
+    let response_schema = serde_json::json!({
+        "type": "OBJECT",
+        "properties": {
+            "intent": { "type": "STRING", "nullable": true },
+            "slots": {
+                "type": "ARRAY",
+                "items": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "name": { "type": "STRING" },
+                        "value": { "type": "STRING" }
+                    },
+                    "required": ["name", "value"]
                 }
             },
-            "required": ["intent", "slots", "message"],
-            "additionalProperties": false
+            "message": { "type": "STRING" }
+        },
+        "required": ["slots", "message"]
+    });
+
+    // 4. Construct Payload
+    // Gemini 1.5 Flash supports system instructions via "system_instruction" field or just prompting.
+    // We will use the standard "contents" approach with system prompt prepended for simplicity/robustness in JSON mode.
+    let full_prompt = format!("{}\n\nUSER INPUT: {}", system_prompt, input);
+
+    let payload = serde_json::json!({
+        "contents": [{
+            "parts": [{ "text": full_prompt }]
+        }],
+        "generationConfig": {
+            "responseMimeType": "application/json",
+            "responseSchema": response_schema
         }
     });
 
-    let res = client.post("https://api.openai.com/v1/chat/completions")
-        .header("Authorization", format!("Bearer {}", api_key))
-        .json(&serde_json::json!({
-            "model": "gpt-4o-2024-08-06", // Ensure version supports Structured Outputs
-            "messages": [
-                { "role": "system", "content": system_prompt },
-                { "role": "user", "content": input }
-            ],
-            "response_format": { 
-                "type": "json_schema",
-                "json_schema": schema
-            }
-        }))
+    // 5. Send Request
+    let res = client.post(&url)
+        .json(&payload)
         .send()
         .await
         .map_err(|e| e.to_string())?;
 
     if !res.status().is_success() {
-        return Err(format!("OpenAI Error: {:?}", res.text().await));
+        return Err(format!("Gemini Error: {:?}", res.text().await));
     }
 
+    // 6. Parse Response
     let body: serde_json::Value = res.json().await.map_err(|e| e.to_string())?;
-    let content = body["choices"][0]["message"]["content"].as_str().unwrap_or("{}");
     
-    serde_json::from_str(content).map_err(|e| e.to_string())
+    // Extract text from: candidates[0].content.parts[0].text
+    let text_content = body["candidates"][0]["content"]["parts"][0]["text"]
+        .as_str()
+        .ok_or("Invalid Gemini response structure")?;
+
+    // Parse the JSON string inside the text
+    serde_json::from_str(text_content).map_err(|e| format!("Failed to parse JSON from LLM: {}. Content: {}", e, text_content))
+}
+
+#[derive(Serialize)]
+struct ChatResponse {
+    role: String,
+    content: String,
+    intent: Option<String>,
 }
 
 async fn chat_handler(
     State(state): State<Arc<AppState>>,
-    Form(input): Form<ChatInput>,
-) -> Html<String> {
+    Json(input): Json<ChatInput>,
+) -> Json<ChatResponse> {
     // 1. Prepare Context (Hold Locks briefly)
     let system_prompt = {
         let schemas = state.schemas.read();
         let mut session = state.session.lock();
         
-        // Update history instantly
-        session.history.push(("User".into(), input.msg.clone()));
+        // Update history instantly (Escape User Input)
+        session.history.push(("User".into(), encode_minimal(&input.msg)));
 
         let schema_context: Vec<String> = schemas.values().map(|s| {
             format!("- Name: {} (Fields: {:?}, Sample: {})", s.name, s.fields, s.sample_data)
@@ -657,14 +737,14 @@ async fn chat_handler(
     let llm_result = call_llm(&input.msg, &system_prompt).await;
 
     // 3. Update State (Re-acquire Locks)
-    let response_text = {
+    let (response_text, intent) = {
          let schemas = state.schemas.read();
          let mut session = state.session.lock();
 
          match llm_result {
             Ok(llm_res) => {
                 // Update Intent
-                if let Some(new_intent) = llm_res.intent {
+                if let Some(new_intent) = llm_res.intent.clone() {
                     if schemas.contains_key(&new_intent) {
                         session.active_intent = Some(new_intent);
                     }
@@ -682,105 +762,32 @@ async fn chat_handler(
                         let missing = check_missing_slots(schema, &session.collected_slots);
                         
                         if missing.is_empty() {
-                             final_msg.push_str(&format!("<br>✅ <b>Complete!</b> Saved {}.", intent));
+                             final_msg.push_str(&format!("<div class='mt-3 p-2.5 rounded-lg bg-success-500/10 border border-success-500/20 text-success-400 text-[11px]'>✓ Complete! Ready to execute <strong>{}</strong></div>", intent));
                              // Persist to DB if we wanted to...
                              session.active_intent = None;
                              session.collected_slots.clear();
                         } else {
-                             final_msg.push_str(&format!("<br><span class='text-red-400'>Missing: {:?}</span>", missing));
+                             final_msg.push_str(&format!("<div class='mt-3 p-2.5 rounded-lg bg-warning-400/10 border border-warning-400/20 text-warning-400 text-[11px]'>Missing: {}</div>", missing.join(", ")));
                         }
                     }
                 }
-                final_msg
+                session.history.push(("Agent".into(), final_msg.clone()));
+                (final_msg, session.active_intent.clone())
             },
-            Err(e) => format!("⚠️ Error: {}", e)
+            Err(e) => {
+                let msg = format!("<span class='text-red-400'>Error: {}</span>", encode_minimal(&e));
+                session.history.push(("System".into(), msg.clone()));
+                (msg, None)
+            }
         }
     };
 
-    // 4. Render
-    {
-        let mut session = state.session.lock();
-        session.history.push(("System".into(), response_text));
-    }
-
-    let schemas = state.schemas.read();
-    let session = state.session.lock();
-    let config = state.config.read();
-    let config_status = format!(
-        r#"Webhook: {} | IRI: {} | Batch: {}"#,
-        config.webhook_url.as_deref().unwrap_or("Not set"),
-        config.ontology_iri,
-        config.export_batch_size
-    );
-    render_full_ui(&session, &schemas, &config_status)
+    Json(ChatResponse {
+        role: "assistant".into(),
+        content: response_text,
+        intent,
+    })
 }
-
-// =================================================================================
-// 6. THE RENDERER
-// =================================================================================
-
-
-
-async fn ui_handler(State(state): State<Arc<AppState>>) -> Html<String> {
-    let session = state.session.lock();
-    let schemas = state.schemas.read();
-    let config = state.config.read();
-    let config_status = format!(
-        r#"Webhook: {} | IRI: {} | Batch: {}"#,
-        config.webhook_url.as_deref().unwrap_or("Not set"),
-        config.ontology_iri,
-        config.export_batch_size
-    );
-    render_full_ui(&session, &schemas, &config_status)
-}
-
-fn render_full_ui(session: &SessionState, schemas: &HashMap<String, LearnedSchema>, config_status: &str) -> Html<String> {
-    // 1. Render Chat
-    let mut chat_html = String::new();
-    for (role, content) in &session.history {
-        let (color, align) = if role == "User" { ("bg-blue-900", "ml-auto") } else { ("bg-gray-800", "mr-auto") };
-        chat_html.push_str(&format!(
-            r#"<div class="{} p-3 rounded-lg max-w-xs {} mb-2 text-sm">
-                <div class="text-xs opacity-50 mb-1">{}</div>
-                <div>{}</div>
-            </div>"#, color, align, role, content
-        ));
-    }
-
-    // 2. Render Brain State (Right Panel)
-    let mut brain_html = String::new();
-    if schemas.is_empty() {
-        brain_html = r#"<div class="text-gray-600 text-center mt-10">Brain Empty.<br>Waiting for data...</div>"#.into();
-    } else {
-        for schema in schemas.values() {
-            // Check if this is the active one
-            let is_active = session.active_intent.as_ref() == Some(&schema.name);
-            let border = if is_active { "border-blue-500 ring-1 ring-blue-500" } else { "border-gray-800" };
-            
-            brain_html.push_str(&format!(
-                r#"<div class="bg-gray-900 p-4 rounded-lg border {} transition-all">
-                    <div class="flex justify-between items-center mb-2">
-                        <span class="font-bold text-blue-400">{}</span>
-                        <span class="text-xs bg-gray-800 px-2 py-1 rounded">{} fields</span>
-                    </div>
-                    <div class="text-xs text-gray-500 font-mono break-all">{}</div>
-                   </div>"#, 
-                border, schema.name, schema.fields.len(), schema.fields.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
-            ));
-        }
-    }
-
-    // 3. Inject
-    let output = HTML_TEMPLATE
-        .replace("{{ CHAT_HISTORY }}", &chat_html)
-        .replace("{{ SCHEMA_VISUALIZATION }}", &brain_html)
-        .replace("{{ CONFIG_STATUS }}", config_status)
-        .replace("id=\"app-root\"", ""); // cleanup
-    
-    // We wrap the whole thing in a div active for HTMX swapping
-    Html(format!("<div id='app-root'>{}</div>", output))
-}
-
 
 #[cfg(test)]
 mod tests {
