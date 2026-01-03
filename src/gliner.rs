@@ -104,68 +104,109 @@ impl GlinerModel {
             label_end_indices.push(input_ids.len()); // End is exclusive? Python checks bounds.
         }
 
-        // 3. Prepare Masks & Spans using WHITESPACE word splitting
-        // The model was trained with words_splitter_type: "whitespace"
-        // This means we split by whitespace FIRST, then map tokens to those words
+        // 3. Prepare Masks & Spans using SentencePiece subword grouping
+        // GLiNER groups tokens into "words" based on the ▁ (U+2581) prefix
 
         let seq_len = input_ids.len();
         let attention_mask_array = Array2::<i64>::ones((batch_size, seq_len));
         let mut words_mask_array = Array2::<i64>::zeros((batch_size, seq_len));
 
         let num_text_tokens = text_ids.len();
-
-        // Step 1: Split original text into whitespace-delimited words and get their char spans
-        let mut word_char_spans: Vec<(usize, usize)> = Vec::new();
-        let mut pos = 0;
-        for word in text.split_whitespace() {
-            if let Some(start) = text[pos..].find(word) {
-                let actual_start = pos + start;
-                let actual_end = actual_start + word.len();
-                word_char_spans.push((actual_start, actual_end));
-                pos = actual_end;
-            }
-        }
-        let num_words = word_char_spans.len();
-
-        println!("DEBUG: Whitespace words count: {}", num_words);
-        println!("DEBUG: Word char spans: {:?}", word_char_spans);
-
-        // Step 2: Map each text token to its whitespace word ID (1-indexed, 0 = special tokens)
-        let mut mapping: Vec<i64> = vec![0; seq_len];
         let tokens = text_encoding.get_tokens();
         let offsets = text_encoding.get_offsets();
 
-        // CLS token (index 0) gets 0
-        mapping[0] = 0;
+        // Debug tokenizer output
+        println!("DEBUG: Tokens and offsets:");
+        for (i, t) in tokens.iter().enumerate() {
+            println!("  Token {}: '{}' offsets={:?}", i, t, offsets.get(i));
+        }
 
-        for token_idx in 1..num_text_tokens {
+        // Map tokens to word IDs using SentencePiece ▁ prefix
+        // A new word starts when:
+        // 1. Token begins with ▁ (and has content after it)
+        // 2. Previous token was a standalone ▁ (space separator)
+        // 3. It's the first content token
+        let mut mapping: Vec<i64> = vec![0; seq_len];
+        let mut current_word_id: i64 = 0;
+
+        // Track word char spans for entity extraction later
+        let mut word_char_spans: Vec<(usize, usize)> = Vec::new();
+        let mut current_word_start: Option<usize> = None;
+        let mut after_standalone_space = false;
+
+        for token_idx in 0..num_text_tokens {
             let token = &tokens[token_idx];
 
-            // Skip special tokens
-            if token == "[SEP]" || token == "[CLS]" || token == "[PAD]" {
+            // Special tokens get 0
+            if token == "[CLS]" || token == "[SEP]" || token == "[PAD]" {
                 mapping[token_idx] = 0;
+                // End current word if any
+                if let Some(start) = current_word_start {
+                    if token_idx > 0 {
+                        if let Some(&(_, prev_end)) = offsets.get(token_idx - 1) {
+                            word_char_spans.push((start, prev_end));
+                        }
+                    }
+                    current_word_start = None;
+                }
+                after_standalone_space = false;
                 continue;
             }
 
-            // Get token's character offsets
-            if let Some(&(tok_start, tok_end)) = offsets.get(token_idx) {
-                if tok_start == tok_end {
-                    // Empty token (sometimes happens with special tokens)
-                    mapping[token_idx] = 0;
-                    continue;
-                }
+            // Check token type
+            let starts_with_space_marker = token.starts_with('▁');
+            let is_standalone_space = token == "▁";
+            let has_content_after_space = starts_with_space_marker && token.len() > "▁".len();
 
-                // Find which whitespace word this token belongs to
-                for (word_idx, &(word_start, word_end)) in word_char_spans.iter().enumerate() {
-                    // Token belongs to word if token's start falls within word's span
-                    if tok_start >= word_start && tok_start < word_end {
-                        // Word IDs are 1-indexed (0 is reserved for special tokens)
-                        mapping[token_idx] = (word_idx + 1) as i64;
-                        break;
+            if is_standalone_space {
+                // Standalone space token - marks word boundary
+                if let Some(start) = current_word_start {
+                    if token_idx > 0 {
+                        if let Some(&(_, prev_end)) = offsets.get(token_idx - 1) {
+                            word_char_spans.push((start, prev_end));
+                        }
+                    }
+                    current_word_start = None;
+                }
+                mapping[token_idx] = 0;
+                after_standalone_space = true;
+                continue;
+            }
+
+            // Determine if this starts a new word
+            let starts_new_word = has_content_after_space ||
+                                  after_standalone_space ||
+                                  current_word_id == 0;
+
+            if starts_new_word {
+                // End previous word if any
+                if let Some(start) = current_word_start {
+                    if token_idx > 0 {
+                        if let Some(&(_, prev_end)) = offsets.get(token_idx - 1) {
+                            word_char_spans.push((start, prev_end));
+                        }
                     }
                 }
+                // Start new word
+                current_word_id += 1;
+                if let Some(&(tok_start, _)) = offsets.get(token_idx) {
+                    current_word_start = Some(tok_start);
+                }
+            }
+
+            // Map token to current word
+            mapping[token_idx] = current_word_id;
+            after_standalone_space = false;
+        }
+
+        // End last word if any
+        if let Some(start) = current_word_start {
+            if let Some(&(_, last_end)) = offsets.get(num_text_tokens.saturating_sub(1)) {
+                word_char_spans.push((start, last_end));
             }
         }
+
+        let num_words = current_word_id as usize;
 
         // Label tokens and padding get 0
         for i in num_text_tokens..seq_len {
@@ -177,30 +218,38 @@ impl GlinerModel {
             words_mask_array[[0, i]] = mapping[i];
         }
 
-        let max_word_id = *mapping.iter().max().unwrap_or(&0);
-        println!("DEBUG: Max word ID in mapping: {}", max_word_id);
+        println!("DEBUG: Num words (from SP grouping): {}", num_words);
+        println!("DEBUG: Word char spans: {:?}", word_char_spans);
+        println!("DEBUG: Full mapping (text portion): {:?}", &mapping[..num_text_tokens.min(mapping.len())]);
 
-        // 4. Generate Spans over whitespace words
-        // Spans are [start, end] where both are word positions (0-indexed)
-        // and end is INCLUSIVE. Width = end - start + 1.
+        // 4. Generate Spans over content token positions
+        // The model expects spans over the positions of tokens with word_id > 0
+        // First, find the indices of content tokens
+        let content_token_indices: Vec<usize> = (0..num_text_tokens)
+            .filter(|&i| mapping[i] > 0)
+            .collect();
+        let num_content_tokens = content_token_indices.len();
+
+        println!("DEBUG: Content token indices: {:?}", content_token_indices);
+        println!("DEBUG: num_content_tokens = {}", num_content_tokens);
 
         let max_width = self.config.max_width;
         let mut spans: Vec<[i64; 2]> = Vec::new();
 
-        // Generate spans for each starting position and each width
-        for start in 0..num_words {
+        // Generate spans over content token positions (0-indexed)
+        for start in 0..num_content_tokens {
             for width in 1..=max_width {
                 let end = start + width - 1; // inclusive end
-                if end < num_words {
+                if end < num_content_tokens {
                     spans.push([start as i64, end as i64]);
                 } else {
-                    // Padding span - still need consistent array size
+                    // Padding span
                     spans.push([0, 0]);
                 }
             }
         }
 
-        println!("DEBUG: Generated {} spans for {} words", spans.len(), num_words);
+        println!("DEBUG: Generated {} spans for {} content tokens", spans.len(), num_content_tokens);
     
         // Construct Span Arrays
         let num_spans = spans.len();
@@ -211,25 +260,33 @@ impl GlinerModel {
             span_idx_array[[0, i, 0]] = span[0];
             span_idx_array[[0, i, 1]] = span[1];
 
-            // Mark valid spans (not padding [0,0] spans that were added for out-of-bounds)
-            let span_width = span[1] - span[0] + 1;
-            // A span is valid if it's within bounds and has reasonable width
-            let is_valid = span_width >= 1 && span_width <= max_width as i64;
-            // Also check that it's not a padding span for an invalid position
-            let span_end_in_bounds = (span[1] as usize) < num_words;
-            span_mask_array[[0, i]] = is_valid && span_end_in_bounds;
+            // Mark valid spans (not padding spans)
+            // Valid if end < num_content_tokens and it's not a pure padding span
+            let is_valid_span = (span[1] as usize) < num_content_tokens;
+            // Also check it's not [0,0] padding when start > 0 was expected
+            let is_meaningful = i < (num_content_tokens * max_width) &&
+                               (span[0] != 0 || span[1] != 0 || i == 0);
+            span_mask_array[[0, i]] = is_valid_span || (span[0] == 0 && span[1] == 0 && i == 0);
         }
 
-        // text_lengths should be the number of whitespace-split words
+        // The model internally computes word embeddings by counting tokens with word_id > 0
+        // So text_lengths should match the number of content tokens, not unique words
+        let content_token_count = mapping[..num_text_tokens]
+            .iter()
+            .filter(|&&x| x > 0)
+            .count();
+        let text_length_value = content_token_count as i64;
+        println!("DEBUG: text_lengths = {} (content tokens)", text_length_value);
+        println!("DEBUG: num_words = {} (unique word IDs)", num_words);
+
         let mut text_lengths_array = Array2::<i64>::zeros((batch_size, 1));
-        text_lengths_array[[0, 0]] = num_words as i64; 
+        text_lengths_array[[0, 0]] = text_length_value; 
         
         let input_ids_array = Array2::from_shape_vec((batch_size, seq_len), input_ids)?;
 
         // Debug inputs before run
-        println!("DEBUG: text_lengths = {}", num_words);
         println!("DEBUG: Span count: {}", num_spans);
-        println!("DEBUG: Token mapping: {:?}", &mapping[..num_text_tokens.min(mapping.len())]);
+        println!("DEBUG: First 5 spans: {:?}", &spans[..5.min(spans.len())]);
 
         let inputs = ort::inputs![
             "input_ids" => Value::from_array(input_ids_array)?,
@@ -247,108 +304,68 @@ impl GlinerModel {
              println!("DEBUG: Output Key: {}, Type: {:?}", k, v.dtype());
         }
 
-        let (shape, data) = outputs["logits"].try_extract_tensor::<f32>()?; // Shape: [batch, num_words, num_spans_per_word, num_classes] or similar
-        
+        let (shape, data) = outputs["logits"].try_extract_tensor::<f32>()?;
+
         // 6. Decode Output
-        // ONNX Output Shape: [Batch, SequenceLength, NumSpansPerWord/K, NumClasses]
-        // shape[0]=B, shape[1]=NumWords, shape[2]=K=12, shape[3]=NumClasses=3
-        let num_detected_classes = shape[3] as usize; 
-        
-        // Validate class count?
-        // if num_detected_classes != labels.len() { ... }
+        // ONNX Output Shape: [Batch, NumWords, MaxWidth, NumClasses]
+        println!("DEBUG: Output shape: {:?}", shape);
+        println!("DEBUG: Output data len: {}", data.len());
+
+        let num_words_out = shape[1] as usize;
+        let max_width_out = shape[2] as usize;
+        let num_classes_out = shape[3] as usize;
+
+        println!("DEBUG: num_words_out={}, max_width_out={}, num_classes_out={}",
+                 num_words_out, max_width_out, num_classes_out);
 
         let mut entities = Vec::new();
-        
-        // Total flattened spans = NumWords * K
-        let total_spans = num_spans; // 288
-        
-        // Debug Tokens
-        println!("DEBUG: Tokenizer output:");
-        for (i, t) in text_encoding.get_tokens().iter().enumerate() {
-            println!("  Token {}: {}  (Offsets: {:?})", i, t, text_encoding.get_offsets().get(i));
-        }
 
-        for i in 0..total_spans {
-            for j in 0..labels.len() { // Iterate over classes
-                if j >= num_detected_classes { break; }
-                
-                // Manual Indexing: [batch, word, span, class] flattened?
-                // data is flat. 
-                // data layout is C-contiguous: B -> Words -> K -> Classes
-                // i corresponds to (Word * K + k) ?
-                // Yes, spans were generated in that order.
-                
-                let idx = i * num_detected_classes + j;
-                let score = if idx < data.len() { data[idx] } else { -100.0 };
-                
-                // Sigmoid
-                let prob = 1.0 / (1.0 + (-score).exp());
-                
-                // Debug Scan: Check for "Cristiano Ronaldo" span [1, 2] (or [1, 3]?)
-                let start_w = spans[i][0];
-                let end_w = spans[i][1];
-                if start_w == 1 && (end_w == 2 || end_w == 3) {
-                     println!("DEBUG: Target Span Check: [{}-{}] Class {} Prob {}", start_w, end_w, j, prob);
+        // Iterate over the output tensor directly
+        // Layout: [batch, word_position, span_width, class]
+        for word_pos in 0..num_words_out.min(num_words) {
+            for width_idx in 0..max_width_out {
+                let span_end = word_pos + width_idx; // inclusive end
+                if span_end >= num_words {
+                    continue; // Out of bounds
                 }
-                
-                if prob > 0.1 {
-                     // Check span coordinates
-                     let start_word = spans[i][0] as usize;
-                     let end_word = spans[i][1] as usize;
-                     
-                     // Hybrid Decoding: Map WordID -> Tokens
-                     // We need to reverse lookup: Which token mapped to start_word?
-                     // Since mapping preserves order, we can find FIRST token with this word ID.
-                     
-                     let mut start_token = 0;
-                     let mut end_token = 0;
-                     
-                     // Find first token for start_word
-                     for (t_idx, &w_id) in mapping.iter().enumerate() {
-                         if w_id == start_word as i64 {
-                             start_token = t_idx;
-                             break;
-                         }
-                     }
 
-                     // Find LAST token for (end_word - 1)
-                     // Since end is exclusive, we want the word before it.
-                     let target_end_word = if end_word > 0 { end_word - 1 } else { 0 };
-                     for (t_idx, &w_id) in mapping.iter().enumerate().rev() { // rev to find last
-                         if w_id == target_end_word as i64 {
-                             end_token = t_idx;
-                             break;
-                         }
-                     }
-                     
-                     // text_encoding.get_offsets() gets char offsets for tokens.
-                     // Ensure within bounds
-                     let mut start_char = usize::MAX;
-                     let mut end_char = 0;
-                     
-                     if let Some(offsets) = text_encoding.get_offsets().get(start_token) {
-                          start_char = offsets.0;
-                     }
-                     if let Some(offsets) = text_encoding.get_offsets().get(end_token) {
-                          end_char = offsets.1;
-                     }
-                     
-                     if start_char < end_char {
+                for class_idx in 0..labels.len().min(num_classes_out) {
+                    // Flat index into the data tensor
+                    let flat_idx = word_pos * (max_width_out * num_classes_out)
+                                 + width_idx * num_classes_out
+                                 + class_idx;
+
+                    if flat_idx >= data.len() {
+                        continue;
+                    }
+
+                    let score = data[flat_idx];
+                    let prob = 1.0 / (1.0 + (-score).exp()); // sigmoid
+
+                    // Debug: Check interesting spans
+                    if word_pos <= 1 && span_end <= 2 && prob > 0.05 {
+                        println!("DEBUG: Span [{}-{}] class={} prob={:.4}",
+                                 word_pos, span_end, labels[class_idx], prob);
+                    }
+
+                    if prob > threshold {
+                        // Map word positions directly to character offsets using word_char_spans
+                        let start_char = word_char_spans[word_pos].0;
+                        let end_char = word_char_spans[span_end].1;
+
                         let entity_text = text[start_char..end_char].to_string();
-                        // Debug print
-                        println!("DEBUG: Candidate Scan: [{}..{}] Text='{}' Label='{}' Score={}", 
-                                  start_token, end_token, entity_text, labels[j], prob);
 
-                        if prob > threshold {
-                            entities.push(Entity {
-                                start: start_char,
-                                end: end_char,
-                                text: entity_text,
-                                label: labels[j].to_string(),
-                                score: prob,
-                            });
-                        }
-                     }
+                        println!("DEBUG: Found entity: '{}' ({}) prob={:.4}",
+                                 entity_text, labels[class_idx], prob);
+
+                        entities.push(Entity {
+                            start: start_char,
+                            end: end_char,
+                            text: entity_text,
+                            label: labels[class_idx].to_string(),
+                            score: prob,
+                        });
+                    }
                 }
             }
         }
