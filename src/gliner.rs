@@ -14,6 +14,8 @@ pub struct GlinerConfig {
     pub vocab_size: usize,
     pub class_token_index: Option<usize>,
     pub sep_token: Option<String>,
+    #[serde(default)]
+    pub words_splitter_type: Option<String>,
 }
 
 pub struct GlinerModel {
@@ -102,100 +104,103 @@ impl GlinerModel {
             label_end_indices.push(input_ids.len()); // End is exclusive? Python checks bounds.
         }
 
-        // 3. Prepare Masks & Spans
-        // words_mask: Group text tokens into words (Semantic Correctness).
-        // text_lengths: Set to seq_len (Shape Correctness).
-        
-        let seq_len = input_ids.len();
-        let mut attention_mask_array = Array2::<i64>::ones((batch_size, seq_len)); 
-        let mut words_mask_array = Array2::<i64>::zeros((batch_size, seq_len));
-
-        // Adjacency-Preserving Hybrid Mask
-        // Goal: Map "Content Tokens" to contiguous Word IDs (1, 2, 3...) so they are adjacent in words_embedding.
-        // Map "Garbage Tokens" (Space, CLS, SEP) to tail Word IDs (N+1, N+2...) to satisfy shape (NumWords == SeqLen).
+        // 3. Prepare Masks & Spans using WHITESPACE word splitting
+        // The model was trained with words_splitter_type: "whitespace"
+        // This means we split by whitespace FIRST, then map tokens to those words
 
         let seq_len = input_ids.len();
-        let mut attention_mask_array = Array2::<i64>::ones((batch_size, seq_len)); 
+        let attention_mask_array = Array2::<i64>::ones((batch_size, seq_len));
         let mut words_mask_array = Array2::<i64>::zeros((batch_size, seq_len));
 
         let num_text_tokens = text_ids.len();
-        
-        let mut content_word_id = 0;
-        let mut garbage_word_id = num_text_tokens; // Start garbage IDs after text region to be safe? 
-                                                  // Actually better to just fill from tail?
-                                                  // Let's us simple 1-based counters.
-        
-        // We need to know which tokens are "Content".
-        // Heuristic: If token is just " " (U+2581) or special, it's garbage.
-        let tokens = text_encoding.get_tokens();
-        
+
+        // Step 1: Split original text into whitespace-delimited words and get their char spans
+        let mut word_char_spans: Vec<(usize, usize)> = Vec::new();
+        let mut pos = 0;
+        for word in text.split_whitespace() {
+            if let Some(start) = text[pos..].find(word) {
+                let actual_start = pos + start;
+                let actual_end = actual_start + word.len();
+                word_char_spans.push((actual_start, actual_end));
+                pos = actual_end;
+            }
+        }
+        let num_words = word_char_spans.len();
+
+        println!("DEBUG: Whitespace words count: {}", num_words);
+        println!("DEBUG: Word char spans: {:?}", word_char_spans);
+
+        // Step 2: Map each text token to its whitespace word ID (1-indexed, 0 = special tokens)
         let mut mapping: Vec<i64> = vec![0; seq_len];
-        
-        // Efficient Hybrid Mask (Merge-Previous + SEP separate)
-        // Goal: Merge Space/Garbage into the PREVIOUS word. 
-        // CLS -> 0.
-        // Cristiano -> 1.
-        // Space -> 1.
-        // Ronaldo -> 2.
-        // SEP -> 3.
-        
-        mapping[0] = 0; // CLS
-        let mut current_word_id = 0;
-        
-        for i in 1..num_text_tokens {
-             let token = &tokens[i];
-             // Check for [SEP], or Just "▁" (Garbage)
-             let is_sep = token == "[SEP]";
-             let is_garbage = token == "▁";
-             
-             if is_sep {
-                 // Sep gets new ID
-                 current_word_id += 1;
-                 mapping[i] = current_word_id as i64;
-             } else if !is_garbage {
-                 // Content gets new ID
-                 current_word_id += 1;
-                 mapping[i] = current_word_id as i64;
-             } else {
-                 // Garbage: Map to current word (merge with previous)
-                 mapping[i] = current_word_id as i64;
-             }
+        let tokens = text_encoding.get_tokens();
+        let offsets = text_encoding.get_offsets();
+
+        // CLS token (index 0) gets 0
+        mapping[0] = 0;
+
+        for token_idx in 1..num_text_tokens {
+            let token = &tokens[token_idx];
+
+            // Skip special tokens
+            if token == "[SEP]" || token == "[CLS]" || token == "[PAD]" {
+                mapping[token_idx] = 0;
+                continue;
+            }
+
+            // Get token's character offsets
+            if let Some(&(tok_start, tok_end)) = offsets.get(token_idx) {
+                if tok_start == tok_end {
+                    // Empty token (sometimes happens with special tokens)
+                    mapping[token_idx] = 0;
+                    continue;
+                }
+
+                // Find which whitespace word this token belongs to
+                for (word_idx, &(word_start, word_end)) in word_char_spans.iter().enumerate() {
+                    // Token belongs to word if token's start falls within word's span
+                    if tok_start >= word_start && tok_start < word_end {
+                        // Word IDs are 1-indexed (0 is reserved for special tokens)
+                        mapping[token_idx] = (word_idx + 1) as i64;
+                        break;
+                    }
+                }
+            }
         }
-        
-        let num_content_words = current_word_id as usize;
-        let total_words = num_content_words; // effective count (CLS=0 .. SEP=N)
-        
-        // Padding
+
+        // Label tokens and padding get 0
         for i in num_text_tokens..seq_len {
-             mapping[i] = 0; 
+            mapping[i] = 0;
         }
-        
+
         // Apply to array
         for i in 0..seq_len {
             words_mask_array[[0, i]] = mapping[i];
         }
 
-        // 4. Generate Spans 
-        // We set text_lengths to cover CLS + Content + SEP (0..N).
-        // Since num_content_words is really 'max_id' (which includes SEP now),
-        // effective_word_count = max_id + 1 (for 0-based indexing size).
-        let effective_word_count = num_content_words + 1; 
-        
-        let mut spans = Vec::new();
+        let max_word_id = *mapping.iter().max().unwrap_or(&0);
+        println!("DEBUG: Max word ID in mapping: {}", max_word_id);
+
+        // 4. Generate Spans over whitespace words
+        // Spans are [start, end] where both are word positions (0-indexed)
+        // and end is INCLUSIVE. Width = end - start + 1.
+
         let max_width = self.config.max_width;
-        
-        for i in 0..=num_content_words { // 0..N includes CLS and SEP
-            for k in 0..max_width {
-                let start = i as i64;
-                let end = (i + k + 1) as i64; 
-                
-                if (i + k) <= num_content_words + 100 { 
-                    spans.push([start, end]);
+        let mut spans: Vec<[i64; 2]> = Vec::new();
+
+        // Generate spans for each starting position and each width
+        for start in 0..num_words {
+            for width in 1..=max_width {
+                let end = start + width - 1; // inclusive end
+                if end < num_words {
+                    spans.push([start as i64, end as i64]);
                 } else {
-                     spans.push([start, start]);
+                    // Padding span - still need consistent array size
+                    spans.push([0, 0]);
                 }
             }
         }
+
+        println!("DEBUG: Generated {} spans for {} words", spans.len(), num_words);
     
         // Construct Span Arrays
         let num_spans = spans.len();
@@ -205,25 +210,26 @@ impl GlinerModel {
         for (i, span) in spans.iter().enumerate() {
             span_idx_array[[0, i, 0]] = span[0];
             span_idx_array[[0, i, 1]] = span[1];
-             if (span[1] - span[0]) < max_width as i64 {
-                 // Valid span?
-                 // Usually mask=1 (True) means VALID in these models.
-                 span_mask_array[[0, i]] = true; 
-             }
+
+            // Mark valid spans (not padding [0,0] spans that were added for out-of-bounds)
+            let span_width = span[1] - span[0] + 1;
+            // A span is valid if it's within bounds and has reasonable width
+            let is_valid = span_width >= 1 && span_width <= max_width as i64;
+            // Also check that it's not a padding span for an invalid position
+            let span_end_in_bounds = (span[1] as usize) < num_words;
+            span_mask_array[[0, i]] = is_valid && span_end_in_bounds;
         }
-        
+
+        // text_lengths should be the number of whitespace-split words
         let mut text_lengths_array = Array2::<i64>::zeros((batch_size, 1));
-        text_lengths_array[[0, 0]] = effective_word_count as i64; 
+        text_lengths_array[[0, 0]] = num_words as i64; 
         
         let input_ids_array = Array2::from_shape_vec((batch_size, seq_len), input_ids)?;
 
         // Debug inputs before run
-        // Check max ID in words_mask
-        let max_id_in_mask = *mapping.iter().max().unwrap_or(&0);
-        println!("DEBUG: Words Mask Max ID: {}. Expected Effective: {}. Num Content: {}", max_id_in_mask, effective_word_count, num_content_words);
+        println!("DEBUG: text_lengths = {}", num_words);
         println!("DEBUG: Span count: {}", num_spans);
-
-        println!("DEBUG: Hybrid Merge-Prev + CLS + SEP. Max ID Logged: {}", num_content_words);
+        println!("DEBUG: Token mapping: {:?}", &mapping[..num_text_tokens.min(mapping.len())]);
 
         let inputs = ort::inputs![
             "input_ids" => Value::from_array(input_ids_array)?,
