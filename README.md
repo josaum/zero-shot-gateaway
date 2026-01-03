@@ -26,26 +26,29 @@ This is a **radical experiment** in AI-native infrastructure consolidation. Inst
 
 ## 🚀 Why Is This So Good?
 
-### 1. **Zero-Copy Physics Engine** 
-Traditional pipelines serialize data to JSON/Protobuf, send over HTTP, then deserialize. **We eliminate all of that.**
+### 1. **Deep Zero-Copy Physics Engine** (Phase 11)
+We implemented **ort::IoBinding** to write ONNX inference outputs directly to the Shared Memory Ring Buffer.
 
 ```
 ┌───────────────┐    ┌─────────────────┐    ┌───────────────┐
 │ Rust Gateway  │───▶│ Shared Memory   │───▶│ Python/PyTorch│
-│  (Producer)   │    │ /tmp/cs_physics │    │  (Consumer)   │
+│ (BGE-M3 ONNX) │    │ /tmp/cs_physics │    │  (Consumer)   │
 └───────────────┘    └─────────────────┘    └───────────────┘
-      WRITE              ZERO-COPY              READ
-      ~50ns               DIRECT               ~100ns
+      │                       ▲                      ▲
+      │ One-Copy (~2µs)       │ Direct               │ Zero-Copy Read
+      └───────────────────────┘                      │
 ```
 
-**Benefits:**
-- **Sub-microsecond latency**: Data appears in Python instantly
-- **No serialization**: Raw bytes mapped directly to NumPy arrays
-- **Lock-free reads**: SeqLock protocol allows concurrent read/write
-- **GPU-ready**: Tensors can be moved to CUDA without copies
+**Capabilities:**
+- **Local BGE-M3 Inference**: Embeddings run inside the gateway process via ONNX Runtime (no HTTP overhead).
+- **GLiNER Integration**: Zero-shot Named Entity Recognition (NER) running locally.
+- **OAR-OCR**: State-of-the-art Document AI (Det/Rec/Layout/Table) running locally.
+- **Lock-Free Reads**: SeqLock protocol allows concurrent read/write without stalling the physics engine.
 
 ### 2. **Any LLM, Locally**
-Swapped from Gemini Cloud to **LM Studio** running on your local network. Full privacy, zero latency to cloud, works offline.
+Swapped from cloud dependency to **Local First**.
+- **Chat/Intent**: Connects to **LM Studio** (or any OpenAI-compatible API) for reasoning.
+- **Embeddings/NER/OCR**: Runs **embedded** within the Rust binary using `ort`.
 
 ```bash
 # Automatically uses your LM Studio at:
@@ -57,8 +60,9 @@ export LLM_BASE_URL="http://localhost:1234/v1"
 
 Tested with:
 - ✅ `qwen/qwen3-4b-thinking-2507` (thinking chain support!)
-- ✅ `text-embedding-bge-m3@f16` (embeddings)
-- ✅ Any OpenAI-compatible API
+- ✅ `text-embedding-bge-m3@f16` (embeddings - local ONNX)
+- ✅ `gliner_base.onnx` (NER - local ONNX)
+- ✅ `oar-ocr` (Document AI - local ONNX)
 
 ### 3. **Thinking Model Support**
 Models like Qwen3-Thinking wrap their reasoning in `<think>...</think>` tags. We parse that automatically:
@@ -88,7 +92,7 @@ pub struct ParticleFrame {
 
 Python reads these directly:
 ```python
-from consumer import PhysicsConsumer
+from scripts.consumer import PhysicsConsumer
 
 with PhysicsConsumer() as consumer:
     for frame in consumer.follow():
@@ -106,8 +110,11 @@ with PhysicsConsumer() as consumer:
 # Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
-# ONNX Runtime (for local embeddings)
+# ONNX Runtime (for local embeddings/OCR/NER)
+# macOS (Homebrew)
 brew install onnxruntime
+# Linux
+# Ensure libonnxruntime.so is in LD_LIBRARY_PATH
 
 # Python consumer
 pip install numpy mmap torch  # torch optional
@@ -115,12 +122,16 @@ pip install numpy mmap torch  # torch optional
 
 ### 2. Run the Gateway
 
-```bash
-# With TUI
-DYLD_LIBRARY_PATH="/opt/homebrew/lib" cargo run --release
+The gateway needs paths to local ONNX models. It handles downloading legacy models, but for Phase 11 features, ensure models are present.
 
-# Headless mode
-DYLD_LIBRARY_PATH="/opt/homebrew/lib" cargo run --release -- --no-tui
+```bash
+# With TUI + OAR Capabilities
+DYLD_LIBRARY_PATH="/opt/homebrew/lib" cargo run --release --features oar -- --no-tui
+
+# Arguments will auto-download models or specify custom paths:
+# --embedding-model path/to/bge-m3.onnx
+# --tokenizer-model path/to/tokenizer.json
+# --gliner-model path/to/gliner.onnx
 ```
 
 ### 3. Send Events
@@ -135,13 +146,13 @@ curl -X POST http://localhost:9382/ingest \
 
 ```bash
 # Follow mode (like tail -f)
-python consumer.py --follow
+python scripts/consumer.py --follow
 
 # Batch read
-python consumer.py --batch 100
+python scripts/consumer.py --batch 100
 
 # PyTorch tensors
-python consumer.py --pytorch --batch 50
+python scripts/consumer.py --pytorch --batch 50
 ```
 
 ---
@@ -150,12 +161,14 @@ python consumer.py --pytorch --batch 50
 
 ```
 /
-├── src/main.rs           # 🧠 Gateway: API, DuckDB, LLM, Physics Engine integration
-├── src/collider.rs       # ⚡ Physics Engine: Shared memory, embeddings, SeqLock
+├── src/main.rs           # 🧠 Gateway: API, DuckDB, LLM Integration
+├── src/collider.rs       # ⚡ Physics Engine: Embeddings, NER, Shared Memory, SeqLock
+├── src/gliner.rs         # 🏷️ Zero-shot NER inference
+├── src/ocr_pipeline.rs   # 👁️ OAR-OCR/OAR-VL Document AI pipeline
 ├── src/tui.rs            # 🖥️ Terminal UI: Ratatui dashboard
-├── consumer.py           # 🐍 Python Consumer: Zero-copy shared memory reader
+├── scripts/consumer.py   # 🐍 Python Consumer: Zero-copy shared memory reader
 ├── Cargo.toml            # Rust dependencies
-├── models/               # ONNX models (optional, uses LM Studio by default)
+├── models/               # ONNX models directory
 └── .env                  # Configuration
 ```
 
@@ -167,7 +180,7 @@ python consumer.py --pytorch --batch 50
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LLM_BASE_URL` | `http://192.168.0.141:1234/v1` | LM Studio / OpenAI endpoint |
+| `LLM_BASE_URL` | `http://192.168.0.141:1234/v1` | LM Studio output/chat endpoint |
 | `DYLD_LIBRARY_PATH` | - | Path to ONNX Runtime (macOS) |
 
 ### CLI Arguments
@@ -176,9 +189,13 @@ python consumer.py --pytorch --batch 50
 ./one_file_gateway --help
 
 Options:
-  --db-path <PATH>   Persistent DuckDB file (default: in-memory)
-  --token <TOKEN>    Bearer token for API auth
-  --no-tui           Headless mode (no terminal UI)
+  --db-path <PATH>           Persistent DuckDB file (default: in-memory)
+  --token <TOKEN>            Bearer token for API auth
+  --no-tui                   Headless mode
+  --embedding-model <PATH>   Path to BGE-M3 ONNX Model
+  --tokenizer-model <PATH>   Path to Tokenizer JSON
+  --gliner-model <PATH>      Path to GLiNER ONNX Model
+  --ocr-pipeline <TYPE>      'legacy', 'oar-structure', 'oar-vl'
 ```
 
 ---
@@ -187,10 +204,10 @@ Options:
 
 ```bash
 # Terminal 1: Start Gateway
-DYLD_LIBRARY_PATH="/opt/homebrew/lib" cargo run --release -- --no-tui
+DYLD_LIBRARY_PATH="/opt/homebrew/lib" cargo run --release --features oar -- --no-tui
 
 # Terminal 2: Start Consumer
-python consumer.py --follow
+python scripts/consumer.py --follow
 
 # Terminal 3: Send test events
 curl -X POST http://localhost:9382/ingest \
@@ -244,8 +261,8 @@ Writer (Rust):                    Reader (Python):
 | Write latency | ~50ns per frame |
 | Read latency | ~100ns per frame |
 | Throughput | 10M+ frames/sec |
-| Memory footprint | ~400MB (100K frames) |
-| Embedding latency (LM Studio) | ~50ms |
+| Embedding (Local ONNX) | ~10-20ms (CPU/Metal) |
+| Memory footprint | ~400MB + Model Weights |
 
 ---
 
@@ -270,5 +287,7 @@ Built with:
 - [Axum](https://github.com/tokio-rs/axum) — Rust web framework
 - [DuckDB](https://duckdb.org/) — Embedded OLAP database
 - [Ratatui](https://ratatui.rs/) — Terminal UI framework
-- [LM Studio](https://lmstudio.ai/) — Local LLM inference
+- [ort](https://ort.pyke.io/) — ONNX Runtime Rust bindings
 - [BGE-M3](https://huggingface.co/BAAI/bge-m3) — Multilingual embeddings
+- [GLiNER](https://github.com/urchade/GLiNER) — Zero-shot NER
+- [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR) — Document AI

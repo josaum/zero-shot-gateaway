@@ -1,22 +1,25 @@
+// use image::GenericImageView;
 use memmap2::MmapMut;
-use ndarray::Array2;
-use ort::session::{Session};
-use ort::session::builder::GraphOptimizationLevel;
-use ort::value::Value;
+// use ndarray::Array2;
+use tracing::info;
 use prometheus::{Counter, Histogram, IntGauge};
 use std::fs::OpenOptions;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH, Instant};
-
-// Use /tmp on macOS for file-backed shared memory simulation
-#[cfg(target_os = "macos")]
-const SHM_PATH: &str = "/tmp/cs_physics";
-#[cfg(not(target_os = "macos"))]
-const SHM_PATH: &str = "/dev/shm/cs_physics";
+use std::sync::atomic::{AtomicU64, AtomicU32, Ordering};
+use std::time::Instant;
 
 const BUFFER_SIZE: usize = 100_000;
-const HEADER_SIZE: usize = 64;
-const MAGIC: u64 = 0x50485953_49435300; // "PHYSICS\0"
+
+#[repr(C, align(64))]
+#[derive(Debug)]
+pub struct Header {
+    pub magic: u64,
+    pub version: u32,
+    pub frame_size: u32,
+    pub capacity: usize,
+    pub head: AtomicU64,
+    pub tail: AtomicU64,
+    pub _pad: [u64; 2],
+}
 
 /// Cache-line aligned frame for optimal memory access
 #[repr(C, align(64))]
@@ -95,7 +98,7 @@ pub struct ColliderMetrics {
     pub write_latency: Histogram,
     pub inference_latency: Histogram,
     pub buffer_head: IntGauge,
-    pub sequence_gaps: Counter,
+    pub _sequence_gaps: Counter,
 }
 
 impl ColliderMetrics {
@@ -111,29 +114,39 @@ impl ColliderMetrics {
                     .buckets(vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5])
             ).unwrap(),
             buffer_head: IntGauge::new("collider_buffer_head", "Current write position").unwrap(),
-            sequence_gaps: Counter::new("collider_sequence_gaps_total", "Detected sequence gaps").unwrap(),
+            _sequence_gaps: Counter::new("collider_sequence_gaps_total", "Detected sequence gaps").unwrap(),
         }
     }
 }
 
+use ort::session::{Session, builder::GraphOptimizationLevel};
+
+use ort::value::Value;
+use tokenizers::Tokenizer;
+
+// ... imports ...
+
 pub struct Collider {
-    mmap: MmapMut,
+    shared: SharedCollider,
     cursor: usize,
     frame_counter: u64,
-    model: Option<Session>,
-    tokenizer: Option<tokenizers::Tokenizer>,
     pub metrics: ColliderMetrics,
-    last_timestamps: std::collections::HashMap<u64, i64>, // conversation_hash -> last timestamp
+    last_timestamps: std::collections::HashMap<u64, i64>,
+    
+    // ONNX Sessions
+    embedding_session: Option<Session>, 
+    tokenizer: Option<Tokenizer>,
+    #[cfg(feature = "oar")]
+    pub ocr_pipeline: Option<Box<dyn crate::ocr_pipeline::OcrPipelineTrait>>,
+    pub gliner_model: Option<crate::gliner::GlinerModel>,
 }
 
-// Safe to implement Debug manually or derive if all fields are Debug. 
-// Session and Tokenizer might not be Debug. 
-// Let's implement Debug manually to be safe and cleaner.
 impl std::fmt::Debug for Collider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Collider")
          .field("cursor", &self.cursor)
          .field("frame_counter", &self.frame_counter)
+         .field("metrics", &self.metrics)
          .field("metrics", &self.metrics)
          .finish()
     }
@@ -142,78 +155,251 @@ impl std::fmt::Debug for Collider {
 unsafe impl Send for Collider {}
 unsafe impl Sync for Collider {}
 
-impl Collider {
-    pub fn new(model_path: &str, tokenizer_path: &str) -> Result<Self, Box<dyn std::error::Error>> {
-        // Calculate total size
-        let total_size = HEADER_SIZE + (BUFFER_SIZE * std::mem::size_of::<ParticleFrame>());
+// --- Shared Memory Layout V2 ---
+// [ Header (64b) ] [ Control Plane (1MB) ] [ Ring Buffer (Frames...) ]
 
-        // Create/open shared memory
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct Attractor {
+    pub position: [f32; 1024], // Target embedding
+    pub mass: f32,             // Influence strength
+    pub label: [u8; 32],       // Short tag (ASCII)
+    pub padding: [u8; 60],     // Align to cache line (approx) -> 4096 + 4 + 32 + 60 = 4192 bytes
+}
+
+#[repr(C)]
+#[derive(Debug)]
+pub struct ControlRegion {
+    pub global_gravity: AtomicU32, // f32 cast to u32 for atomic access
+    pub friction: AtomicU32,       // f32 cast to u32
+    pub attractor_count: AtomicU32,
+    pub _pad1: u32,
+    pub attractors: [Attractor; 64], // Fixed capacity for now
+}
+
+// Total Control Region size: 16 (header) + 64 * 4192 = ~268KB. We reserve 1MB.
+const CONTROL_PLANE_SIZE: usize = 1024 * 1024; // 1MB
+
+pub struct SharedCollider {
+    _file: std::fs::File,
+    _mmap: MmapMut,
+    pub header: *mut Header,
+    pub control: *mut ControlRegion, // Pointer to Control Plane
+    pub frames: *mut ParticleFrame,
+    pub capacity: usize,
+    // ...
+}
+
+unsafe impl Send for SharedCollider {}
+unsafe impl Sync for SharedCollider {}
+
+impl SharedCollider {
+    pub fn new(capacity: usize) -> std::io::Result<Self> {
+        let path = if cfg!(target_os = "macos") {
+            "/tmp/cs_physics"
+        } else {
+            "/dev/shm/cs_physics"
+        };
+
+        // Calculate V2 Layout
+        let header_size = std::mem::size_of::<Header>();
+        // Align Control Plane to 4KB page
+        let control_offset = (header_size + 4095) & !4095;
+        
+        let frame_size = std::mem::size_of::<ParticleFrame>();
+        
+        // Ring Buffer starts after Control Plane (also aligned)
+        let ring_offset = control_offset + CONTROL_PLANE_SIZE;
+        
+        // Total size
+        let total_size = ring_offset + (frame_size * capacity);
+
         let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
-            .open(SHM_PATH)?;
+            .open(path)?;
+
         file.set_len(total_size as u64)?;
 
         let mut mmap = unsafe { MmapMut::map_mut(&file)? };
 
-        // Initialize header
-        let header = mmap.as_mut_ptr();
+        // Initialize Header if fresh
+        let header_ptr = mmap.as_mut_ptr() as *mut Header;
         unsafe {
-            std::ptr::write(header as *mut u64, MAGIC);
-            std::ptr::write(header.add(8) as *mut u32, 1); // version
-            std::ptr::write(header.add(12) as *mut u32, std::mem::size_of::<ParticleFrame>() as u32);
-            std::ptr::write(header.add(16) as *mut u64, BUFFER_SIZE as u64);
-            // head and tail start at 0
+            if (*header_ptr).magic != 0xCAFEBABE {
+                (*header_ptr).magic = 0xCAFEBABE;
+                (*header_ptr).version = 2; // V2
+                (*header_ptr).capacity = capacity;
+                (*header_ptr).frame_size = frame_size as u32;
+                (*header_ptr).head.store(0, Ordering::SeqCst);
+                (*header_ptr).tail.store(0, Ordering::SeqCst);
+                
+                // Init Control Region
+                let control_ptr = mmap.as_mut_ptr().add(control_offset) as *mut ControlRegion;
+                std::ptr::write_bytes(control_ptr, 0, 1);
+                // Default Gravity parameters (using u32 bits of f32 1.0)
+                let f1: f32 = 1.0;
+                let f01: f32 = 0.1;
+                (*control_ptr).global_gravity.store(f1.to_bits(), Ordering::Relaxed);
+                (*control_ptr).friction.store(f01.to_bits(), Ordering::Relaxed);
+                (*control_ptr).attractor_count.store(0, Ordering::Relaxed);
+            }
         }
-
-        // Load ONNX model with optimization
-        // Wrap in catch_unwind because ort might panic if libonnxruntime is missing
-        let model = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            match Session::builder().and_then(|b| 
-                b.with_optimization_level(GraphOptimizationLevel::Level3)
-                 .and_then(|b| b.with_intra_threads(4))
-                 .and_then(|b| b.commit_from_file(model_path))
-            ) {
-                Ok(m) => Some(m),
-                Err(e) => {
-                    eprintln!("⚠️ WARN: Failed to load ONNX model ({}). Running in MOCK mode.", e);
-                    None
-                }
-            }
-        })).unwrap_or_else(|_| {
-            eprintln!("⚠️ CRITICAL: ORT Runtime Panic (likely missing libonnxruntime). Defaulting to MOCK mode.");
-            None
-        });
-
-        let tokenizer = match tokenizers::Tokenizer::from_file(tokenizer_path) {
-            Ok(t) => Some(t),
-            Err(e) => {
-                eprintln!("⚠️ WARN: Failed to load Tokenizer ({}). Running in MOCK mode.", e);
-                None
-            }
-        };
+        
+        let control_ptr = unsafe { mmap.as_mut_ptr().add(control_offset) as *mut ControlRegion };
+        let frames_ptr = unsafe { mmap.as_mut_ptr().add(ring_offset) as *mut ParticleFrame };
 
         Ok(Self {
-            mmap,
+            _file: file,
+            _mmap: mmap,
+            header: header_ptr,
+            control: control_ptr,
+            frames: frames_ptr,
+            capacity,
+        })
+    }
+}
+
+impl Collider {
+    pub fn new(
+        #[cfg(feature = "oar")]
+        ocr_pipeline: Option<Box<dyn crate::ocr_pipeline::OcrPipelineTrait>>, 
+        gliner_model: Option<crate::gliner::GlinerModel>,
+        embedding_model_path: Option<&str>,
+        tokenizer_path: Option<&str>,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        // Initialize Shared Memory
+        let shared = SharedCollider::new(BUFFER_SIZE)?;
+
+        // Load Embedding Model (BGE-M3-Int8)
+        let mut embedding_session = None;
+        let mut tokenizer = None;
+
+        if let (Some(model_path), Some(tok_path)) = (embedding_model_path, tokenizer_path) {
+            info!("🧠 Loading Embedding Model from: {}", model_path);
+            
+            match Session::builder()?
+                .with_optimization_level(GraphOptimizationLevel::Level3)?
+                .with_intra_threads(4)?
+                .commit_from_file(model_path) {
+                    Ok(session) => {
+                         embedding_session = Some(session);
+                         
+                         info!("🔤 Loading Tokenizer from: {}", tok_path);
+                         match Tokenizer::from_file(tok_path) {
+                             Ok(t) => tokenizer = Some(t),
+                             Err(e) => eprintln!("⚠️ Failed to load tokenizer: {}", e),
+                         }
+                    },
+                    Err(e) => eprintln!("⚠️ Failed to load embedding session: {}", e),
+                }
+        }
+
+        Ok(Self {
+            shared,
             cursor: 0,
             frame_counter: 0,
-            model,
-            tokenizer,
             metrics: ColliderMetrics::new(),
             last_timestamps: std::collections::HashMap::new(),
+            embedding_session,
+            tokenizer,
+            #[cfg(feature = "oar")]
+            ocr_pipeline,
+            gliner_model,
         })
     }
 
-    /// Compute embedding via LM Studio OpenAI-compatible API
-    fn embed(&mut self, text: &str) -> Result<[f32; 1024], Box<dyn std::error::Error>> {
+    /// Run full OCR Pipeline on a file path
+    pub fn process_ocr_image(&mut self, path: &str) -> Result<String, Box<dyn std::error::Error>> {
+        #[cfg(feature = "oar")]
+        if let Some(pipeline) = &mut self.ocr_pipeline {
+             info!("🧪 Using OCR Pipeline: {}", pipeline.name());
+             let result = pipeline.process_file(path)?;
+             return Ok(result.markdown);
+        }
+        Ok(String::new())
+    }
+
+    pub fn process_ner(&mut self, text: &str) -> Result<Vec<crate::gliner::Entity>, Box<dyn std::error::Error>> {
+        if let Some(model) = &mut self.gliner_model {
+            // Default labels for general entity extraction
+            let labels = ["person", "organization", "date", "money", "location"];
+            return model.predict_entities(text, &labels, 0.4).map_err(|e| e.into());
+        }
+        Ok(Vec::new())
+    }
+
+    fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+        let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+        let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+        
+        if norm_a == 0.0 || norm_b == 0.0 {
+            0.0
+        } else {
+            dot_product / (norm_a * norm_b)
+        }
+    }
+
+    /// Compute embedding with Deep Zero-Copy using ort::IoBinding
+    fn embed(&mut self, text: &str, output: &mut [f32]) -> Result<(), Box<dyn std::error::Error>> {
         let start = Instant::now();
+
+        // 1. Local BGE-M3 Inference (Deep Zero-Copy attempt via IoBinding)
+        if let (Some(session), Some(tokenizer)) = (&mut self.embedding_session, &self.tokenizer) {
+             let output_names: Vec<String> = session.outputs.iter().map(|o| o.name.clone()).collect();
+             println!("Model Outputs: {:?}", output_names); // Debug
+             let encoding = tokenizer.encode(text, true)
+                .map_err(|e| Box::new(std::io::Error::new(std::io::ErrorKind::Other, format!("Tokenizer error: {}", e))) as Box<dyn std::error::Error>)?;
+             let input_ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
+             let attention_mask: Vec<i64> = encoding.get_attention_mask().iter().map(|&x| x as i64).collect();
+             
+             let batch_size = 1;
+             let seq_len = input_ids.len();
+             
+             let input_tensor = ndarray::Array2::from_shape_vec((batch_size, seq_len), input_ids)?;
+             let attention_tensor = ndarray::Array2::from_shape_vec((batch_size, seq_len), attention_mask)?;
+             
+             // Create IOBinding
+             let mut binding = session.create_binding()?;
+             
+             // Bind Inputs (Consumes tensor, zero-copy to ort Value)
+             let input_val = Value::from_array(input_tensor)?;
+             let attention_val = Value::from_array(attention_tensor)?;
+             
+             binding.bind_input("input_ids", &input_val)?;
+             binding.bind_input("attention_mask", &attention_val)?;
+             
+             // Output: Runtime allocates
+             // We use One-Copy Output strategy for stability (4KB copy is negligible)
+             let output_name = "last_hidden_state";
+             let mem_info = session.allocator().memory_info();
+             binding.bind_output_to_device(output_name, &mem_info)?;
+             
+             // Run
+             let outputs = session.run_binding(&binding)?;
+             
+             // Extract and copy
+             // try_extract_tensor returns (shape, data_slice)
+             let (_, data) = outputs[output_name].try_extract_tensor::<f32>()?;
+             
+             // Copy to shared memory
+             for (i, v) in data.iter().take(1024).enumerate() {
+                 output[i] = *v;
+             }
+             
+             self.metrics.inference_latency.observe(start.elapsed().as_secs_f64());
+             return Ok(());
+        }
+
+        // 2. Fallback to HTTP (Legacy / Debug)
+        // ... (previous logic, but writing to output slice)
         
         let base_url = std::env::var("LLM_BASE_URL")
             .unwrap_or_else(|_| "http://192.168.0.141:1234/v1".to_string());
         let url = format!("{}/embeddings", base_url);
         
-        // Use blocking reqwest since we're in a sync context
         let client = reqwest::blocking::Client::new();
         let payload = serde_json::json!({
             "model": "text-embedding-bge-m3@f16",
@@ -229,80 +415,112 @@ impl Collider {
             Ok(response) => {
                 if response.status().is_success() {
                     let body: serde_json::Value = response.json()?;
-                    // OpenAI embeddings format: data[0].embedding
                     if let Some(embedding_array) = body["data"][0]["embedding"].as_array() {
-                        let mut embedding = [0.0f32; 1024];
                         for (i, val) in embedding_array.iter().take(1024).enumerate() {
-                            embedding[i] = val.as_f64().unwrap_or(0.0) as f32;
+                            output[i] = val.as_f64().unwrap_or(0.0) as f32;
                         }
                         self.metrics.inference_latency.observe(start.elapsed().as_secs_f64());
-                        return Ok(embedding);
+                        return Ok(());
                     }
                 }
-                eprintln!("⚠️ LM Studio embedding failed, using zero vector");
             }
             Err(e) => {
                 eprintln!("⚠️ LM Studio connection error: {}", e);
             }
         }
         
-        // Fallback to zero embedding
-        Ok([0.0; 1024])
+        // Zero out on failure
+        output.fill(0.0);
+        Ok(())
     }
 
     /// Write a frame to the ring buffer using SeqLock protocol
-    pub fn smash(&mut self, event: &ConversationEvent) -> Result<(), Box<dyn std::error::Error>> {
+    /// Applies Gravitational Learning logic
+    pub fn smash(&mut self, event: &mut ConversationEvent) -> Result<(), Box<dyn std::error::Error>> {
         let write_start = Instant::now();
 
-        // 1. Compute embedding
-        // Handle potential empty strings or tokenizer/model failures gracefully
-        let semantic = self.embed(&event.text).unwrap_or([0.0; 1024]);
+        // 0. OCR Enrichment (if image path provided)
+        if let Some(path) = &event.image_path {
+             // Unified Reconstruction Pipeline (ocr + layout + merge)
+             match self.process_ocr_image(path) {
+                 Ok(extracted_text) => {
+                     if !extracted_text.is_empty() {
+                         // println!("📄 Markdown Extracted: {:.50}...", extracted_text); // debug
+                         event.text.push_str("\n");
+                         event.text.push_str(&extracted_text);
+                     }
+                 }
+                 Err(e) => eprintln!("⚠️ OCR/Reconstruction Failed for {}: {}", path, e),
+             }
+        }
 
-        // 2. Calculate kinetics
-        let now = std::time::SystemTime::now();
-        let now_us = now.duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or(std::time::Duration::ZERO)
-            .as_micros() as i64;
+        // 5. Get pointer from SharedCollider (EARLY ACCESS for Zero-Copy)
+        let frame_ptr = unsafe { self.shared.frames.add(self.cursor) };
 
-        let delta_time = self.last_timestamps
-            .get(&event.conversation_hash)
-            .map(|&last| {
-                let diff_us = now_us - last;
-                if diff_us > 0 {
-                    ((diff_us as f64) / 1_000_000.0).ln() as f32
-                } else {
-                    0.0
-                }
-            })
-            .unwrap_or(0.0);
-
-        self.last_timestamps.insert(event.conversation_hash, now_us);
-
-        // 3. Calculate buffer offset
-        let frame_offset = HEADER_SIZE + (self.cursor * std::mem::size_of::<ParticleFrame>());
-        
-        // Unsafe pointer arithmetic to get mutable reference to the frame
-        // This is safe because we own the mmap and are the single writer
-        let frame_ptr = unsafe { self.mmap.as_mut_ptr().add(frame_offset) as *mut ParticleFrame };
-
-        // 4. SeqLock write protocol
+        // 6. SeqLock write protocol
         unsafe {
             let frame = &mut *frame_ptr;
 
-            // 4a. Increment sequence to ODD (write in progress)
             let old_seq = frame.sequence.load(Ordering::Relaxed);
             let new_seq = old_seq.wrapping_add(1);
             frame.sequence.store(new_seq, Ordering::Release);
 
-            // 4b. Memory barrier
             std::sync::atomic::fence(Ordering::Release);
 
-            // 4c. Write payload (non-atomic fields)
+            // 1. Compute embedding (Directly into Shared Memory!)
+            // We do this *inside* the write lock because we are modifying the data
+            // This blocks readers slightly longer but avoids the copy.
+            self.embed(&event.text, &mut frame.semantic).unwrap_or_else(|e| {
+                eprintln!("Embedding failed: {}", e);
+                // Zero out if failed
+                frame.semantic.fill(0.0);
+            });
+            
+            let semantic_ref = &frame.semantic; // Use for gravity calculation
+
+            // 2. Gravitational Learning (Physics)
+            let mut gravity_boost = 0.0;
+            let control = &*self.shared.control;
+            let g_bits = control.global_gravity.load(Ordering::Relaxed);
+            let g = f32::from_bits(g_bits);
+            let count = control.attractor_count.load(Ordering::Relaxed).min(64) as usize;
+            
+            for i in 0..count {
+                let attractor = &control.attractors[i];
+                let sim = Self::cosine_similarity(semantic_ref, &attractor.position);
+                if sim > 0.8 {
+                     gravity_boost += attractor.mass * sim * g;
+                }
+            }
+
+            // 3. Calculate Kinetics (Restored)
+            let now = std::time::SystemTime::now();
+            let now_us = now.duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or(std::time::Duration::ZERO)
+                .as_micros() as i64;
+
+            let delta_time = self.last_timestamps
+                .get(&event.conversation_hash)
+                .map(|&last| {
+                    let diff_us = now_us - last;
+                    if diff_us > 0 {
+                        ((diff_us as f64) / 1_000_000.0).ln() as f32
+                    } else {
+                        0.0
+                    }
+                })
+                .unwrap_or(0.0);
+
+            self.last_timestamps.insert(event.conversation_hash, now_us);
+            
+            let final_velocity = event.velocity + gravity_boost;
+
+            // 4. Write Frame Data
             frame.frame_id = self.frame_counter;
-            frame.semantic = semantic;
+            // frame.semantic is already set!
             frame.delta_time = delta_time;
             frame.duration_ms = event.duration_ms;
-            frame.velocity = event.velocity;
+            frame.velocity = final_velocity; 
             frame.interrupt = event.interrupt;
             frame.timestamp_us = now_us;
             frame.conversation_hash = event.conversation_hash;
@@ -315,23 +533,25 @@ impl Collider {
             frame.sentiment = event.sentiment;
             frame.confidence = event.confidence;
             frame.spin = event.spin;
+            
+            // TODO: Add field for attractor_label in ParticleFrame if we want to visualize it
+            // For now, we just use the velocity boost effect
 
-            // 4d. Memory barrier
             std::sync::atomic::fence(Ordering::Release);
 
-            // 4e. Increment sequence to EVEN (write complete)
             frame.sequence.store(new_seq.wrapping_add(1), Ordering::Release);
         }
 
-        // 5. Update head pointer atomically
-        let head_ptr = unsafe { (self.mmap.as_ptr().add(24) as *const AtomicU64).as_ref().unwrap() };
-        head_ptr.store(self.cursor as u64, Ordering::Release);
+        // 7. Update head atomically
+        unsafe {
+            (*self.shared.header).head.store(self.cursor as u64, Ordering::Release);
+        }
 
-        // 6. Advance cursor
-        self.cursor = (self.cursor + 1) % BUFFER_SIZE;
+        // 8. Advance cursor
+        self.cursor = (self.cursor + 1) % self.shared.capacity;
         self.frame_counter += 1;
 
-        // 7. Metrics
+        // 9. Metrics
         self.metrics.frames_written.inc();
         self.metrics.buffer_head.set(self.cursor as i64);
         self.metrics.write_latency.observe(write_start.elapsed().as_secs_f64());
@@ -340,7 +560,7 @@ impl Collider {
     }
 }
 
-/// Input event structure
+
 #[derive(Debug, Clone)]
 pub struct ConversationEvent {
     pub text: String,
@@ -357,6 +577,8 @@ pub struct ConversationEvent {
     pub sentiment: f32,
     pub confidence: f32,
     pub spin: [f32; 4],
+    pub image_path: Option<String>,
+    pub _structured_data: Option<serde_json::Value>,
 }
 
 impl Default for ConversationEvent {
@@ -376,6 +598,8 @@ impl Default for ConversationEvent {
             sentiment: 0.0,
             confidence: 0.0,
             spin: [1.0, 0.0, 0.0, 0.0], // Identity quaternion
+            image_path: None,
+            _structured_data: None,
         }
     }
 }
@@ -385,19 +609,29 @@ use parking_lot::Mutex;
 
 /// Thread-safe collider for use in Axum handlers
 #[derive(Debug)]
-pub struct SharedCollider {
+pub struct LockedCollider {
     pub inner: Mutex<Collider>,
 }
 
-impl SharedCollider {
-    pub fn new(model_path: &str, tokenizer_path: &str) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
+impl LockedCollider {
+    pub fn new(
+        #[cfg(feature = "oar")]
+        ocr_pipeline: Option<Box<dyn crate::ocr_pipeline::OcrPipelineTrait>>, 
+        gliner_model: Option<crate::gliner::GlinerModel>,
+        embedding_model_path: Option<&str>,
+        tokenizer_path: Option<&str>
+    ) -> Result<Arc<Self>, Box<dyn std::error::Error>> {
         Ok(Arc::new(Self {
-            inner: Mutex::new(Collider::new(model_path, tokenizer_path)?),
+            #[cfg(feature = "oar")]
+            inner: Mutex::new(Collider::new(ocr_pipeline, gliner_model, embedding_model_path, tokenizer_path)?),
+            #[cfg(not(feature = "oar"))]
+            inner: Mutex::new(Collider::new(gliner_model, embedding_model_path, tokenizer_path)?),
         }))
     }
 
-    pub fn smash(&self, event: &ConversationEvent) -> Result<(), Box<dyn std::error::Error>> {
-        self.inner.lock().smash(event)
+    pub fn smash(&self, event: &mut ConversationEvent) -> Result<(), Box<dyn std::error::Error>> {
+        let mut collider = self.inner.lock();
+        collider.smash(event)
     }
 
     pub fn metrics(&self) -> ColliderMetrics {

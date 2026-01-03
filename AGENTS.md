@@ -1,6 +1,6 @@
 # Build, Lint, and Test Commands
-- **Build**: `cargo build`
-- **Run**: `cargo run --bin one_file_gateway`
+- **Build**: `cargo build --features oar`
+- **Run**: `cargo run --bin one_file_gateway --features oar`
 - **Check**: `cargo check`
 - **Lint**: `cargo clippy`
 - **Test (All)**: `cargo test`

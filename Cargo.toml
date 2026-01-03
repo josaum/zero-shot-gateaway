@@ -8,6 +8,7 @@ axum = { version = "0.7", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+anyhow = "1.0"
 duckdb = { version = "1.0", features = ["bundled", "vtab-arrow"] }
 parking_lot = "0.12" # Faster Mutexes
 chrono = "0.4"
@@ -15,15 +16,30 @@ reqwest = { version = "0.12", features = ["json", "blocking"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tokio-util = "0.7"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 htmlescape = "0.3"
 dotenvy = "0.15"
 ratatui = "0.29"
 crossterm = "0.28"
 syntect = "5.2"
 memmap2 = "0.9"
-ort = { version = "2.0.0-rc.9", features = ["load-dynamic", "download-binaries"] }
+ort = { version = "=2.0.0-rc.10", features = ["load-dynamic", "download-binaries", "ndarray"] }
 ndarray = "0.16"
+pdfium-render = { version = "0.8", features = ["image"] }
 tokenizers = "0.21"
 bytemuck = { version = "1.21", features = ["derive"] }
 prometheus = "0.13"
+image = "0.25.9"
+
+# OAR-OCR for advanced document understanding
+oar-ocr = { version = "0.5", optional = true, default-features = false, features = ["download-binaries"] }
+
+# Candle for VL inference (optional, for oar-ocr VL feature)
+candle-core = { version = "0.9.2-alpha.2", optional = true }
+
+[features]
+default = []
+oar = ["oar-ocr"]
+vl = ["oar-ocr", "oar-ocr/vl", "candle-core"]
+cuda = ["oar-ocr", "oar-ocr/cuda"]
+

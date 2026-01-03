@@ -6,8 +6,9 @@ A single-binary Rust application serving as a high-performance Event Gateway wit
 **Stack:**
 - **Core**: Rust + Axum + Tokio
 - **Database**: DuckDB + Arrow IPC
-- **AI**: LM Studio (OpenAI-compatible, local)
-- **Physics Engine**: Shared Memory + SeqLock
+- **AI (Logic)**: LM Studio (Qwen-Thinking, etc.)
+- **AI (Feature Eng)**: Local ONNX (BGE-M3, GLiNER, OAR-OCR) via `ort`
+- **Physics Engine**: Shared Memory + SeqLock + Deep Zero-Copy
 - **UI**: Ratatui (Terminal)
 - **Consumer**: Python + NumPy/PyTorch
 
@@ -15,9 +16,11 @@ A single-binary Rust application serving as a high-performance Event Gateway wit
 ```
 /
 ├── src/main.rs          # API, DuckDB, LLM integration
-├── src/collider.rs      # Physics Engine: SharedMem, SeqLock, embeddings
+├── src/collider.rs      # Physics Engine: SharedMem, SeqLock, IoBinding
+├── src/gliner.rs        # Zero-shot NER Engine
+├── src/ocr_pipeline.rs  # Document AI (OAR-OCR)
 ├── src/tui.rs           # Ratatui terminal UI
-├── consumer.py          # Python zero-copy consumer
+├── scripts/consumer.py  # Python zero-copy consumer
 ├── Cargo.toml           # Dependencies
 └── .env                 # LLM_BASE_URL config
 ```
@@ -26,13 +29,15 @@ A single-binary Rust application serving as a high-performance Event Gateway wit
 
 1. **Zero-Copy Always**: 
    - DuckDB → Arrow RecordBatch → TUI (no struct conversion)
-   - Physics Engine → mmap → numpy (direct memory access)
+   - Physics Engine (ONNX) → Shared Memory → Python numpy (direct memory access)
 
 2. **Lock-Free Reads**: SeqLock protocol enables concurrent read/write
 
 3. **Thinking Models**: Supports `<think>...</think>` wrapped output (Qwen3, etc.)
 
-4. **Local LLM First**: Default endpoint is LM Studio at `http://192.168.0.141:1234/v1`
+4. **Local Execution**: 
+   - LLM: LM Studio at `http://192.168.0.141:1234/v1`
+   - Embeddings/NER/OCR: Inside the binary via ONNX Runtime
 
 ## Dependencies
 ```toml
@@ -42,23 +47,24 @@ duckdb = { version = "1.0", features = ["bundled", "vtab-arrow"] }
 ratatui = "0.29"
 reqwest = { version = "0.12", features = ["json", "blocking"] }
 memmap2 = "0.9"
-ort = { version = "2.0.0-rc.9", features = ["load-dynamic"] }
+ort = { version = "2.0", features = ["load-dynamic"] }
+tokenizers = "0.19"
 ```
 
 ## Key Components
 
 ### Physics Engine (collider.rs)
 - **ParticleFrame**: 4KB struct with 1024-dim embedding, kinetics, spin
+- **IoBinding**: Writes inference results directly to `ParticleFrame.semantic`
 - **Ring Buffer**: 100,000 frames in shared memory
 - **SeqLock**: Odd sequence = writing, Even = valid
-- **Embeddings**: Via LM Studio `/embeddings` endpoint (BGE-M3)
 
 ### LLM Integration (main.rs)
-- **call_llm()**: Posts to LM Studio `/chat/completions`
+- **call_llm()**: Posts to LM Studio `/chat/completions` for intent/logic
 - **strip_thinking_chain()**: Removes `<think>` tags, extracts JSON
 - **LLMResponse**: Optional fields for flexible model support
 
-### Python Consumer (consumer.py)
+### Python Consumer (scripts/consumer.py)
 - **PhysicsConsumer.follow()**: Generator for real-time frames
 - **PyTorchConsumer**: Direct tensor output
 - **SeqLock validation**: Retry on torn reads
@@ -76,7 +82,7 @@ Event → LLM (intent) → DuckDB → Physics Engine → Shared Memory → Pytho
 DYLD_LIBRARY_PATH="/opt/homebrew/lib" cargo run --release -- --no-tui
 
 # Consumer
-python consumer.py --follow
+python scripts/consumer.py --follow
 
 # Test
 curl -X POST http://localhost:9382/ingest -H "Content-Type: application/json" \

@@ -16,12 +16,12 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 use duckdb::arrow::record_batch::RecordBatch;
 use duckdb::arrow::array::Array;
-use duckdb::Arrow;
+
 
 use crate::{AppState, LearnedSchema};
 
 #[derive(Debug, Clone)]
-pub struct EventLog {
+pub struct _EventLog {
     pub event_type: String,
     pub payload: String,
     pub received_at: String,
@@ -250,7 +250,7 @@ async fn listen_for_updates(state: Arc<AppState>, tx: mpsc::Sender<AppUpdate>) {
             Ok(_) => {
                 fetch_and_send(&state, &tx).await;
             }
-            Err(e) => {
+            Err(_e) => {
                 // If lagged, just fetch anyway
                 fetch_and_send(&state, &tx).await;
             }
@@ -262,7 +262,7 @@ async fn fetch_and_send(state: &Arc<AppState>, tx: &mpsc::Sender<AppUpdate>) {
     // Fetch events from DuckDB (Arrow Zero-Copy)
     let events = {
         let db = state.db.lock();
-        let mut stmt = db.prepare("SELECT type, payload::VARCHAR, received_at::VARCHAR FROM events ORDER BY received_at DESC LIMIT 50").ok();
+        let stmt = db.prepare("SELECT type, payload::VARCHAR, timestamp FROM events ORDER BY timestamp DESC LIMIT 100").ok();
         if let Some(mut stmt) = stmt {
             // Use arrow interface directly
             stmt.query_arrow([])

@@ -18,7 +18,14 @@ use tracing::{info, warn, error};
 
 mod tui;
 mod collider;
-use collider::{SharedCollider, ConversationEvent, ColliderMetrics};
+mod models;
+mod schema_registry;
+#[cfg(feature = "oar")]
+mod ocr_pipeline;
+mod gliner;
+
+use collider::{LockedCollider, ConversationEvent, ColliderMetrics};
+use gliner::GlinerModel;
 
 
 // The "Truth" derived from the event stream
@@ -110,7 +117,7 @@ struct AppState {
     // Real-time notification channel
     tx_notify: broadcast::Sender<()>,
     // Physics Engine Collider
-    collider: Arc<SharedCollider>,
+    collider: Arc<LockedCollider>,
 }
 
 #[derive(Parser, Debug)]
@@ -127,6 +134,53 @@ struct Args {
    /// Run without the Terminal UI (headless mode)
    #[arg(long)]
    no_tui: bool,
+
+   /// Path or URL for the Embedding Model (ONNX)
+   #[arg(long, env = "EMBEDDING_MODEL")]
+   embedding_model: Option<String>,
+
+   /// Path or URL for the Tokenizer (JSON)
+   #[arg(long, env = "TOKENIZER_MODEL")]
+   tokenizer_model: Option<String>,
+
+   /// Path or URL for OCR Table Cell Detection Model (RT-DETR)
+   #[arg(long, env = "OCR_TABLE_CELL_MODEL")]
+   ocr_table_cell_model: Option<String>,
+
+   /// Path or URL for PaddleOCR Detection Model (ONNX)
+   #[arg(long, env = "OCR_DET_MODEL")]
+   ocr_det_model: Option<String>,
+
+   /// Path or URL for PaddleOCR Recognition Model (ONNX)
+   #[arg(long, env = "OCR_REC_MODEL")]
+   ocr_rec_model: Option<String>,
+
+   /// Path or URL for PaddleOCR Layout Model (ONNX) - Optional/Manual
+   #[arg(long, env = "OCR_LAYOUT_MODEL")]
+   ocr_layout_model: Option<String>,
+
+   /// Path or URL for PaddleOCR Table Model (SLANet ONNX) - Optional/Manual
+   #[arg(long, env = "OCR_TABLE_MODEL")]
+   ocr_table_model: Option<String>,
+
+   /// Path or URL for OCR Character Dictionary (txt)
+   #[arg(long, env = "OCR_KEYS_MODEL")]
+   ocr_keys_model: Option<String>,
+
+   /// Path or URL for GLiNER Model (NER / Structured Extraction)
+   #[arg(long, env = "OCR_NER_MODEL", default_value = "models/gliner_multi_v2.1")]
+   ocr_ner_model: String,
+
+   /// OCR Pipeline to use: legacy, oar-structure, oar-vl
+   #[arg(long, env = "OCR_PIPELINE", default_value = "oar-structure")]
+   ocr_pipeline: String,
+
+   /// Path to PaddleOCR-VL model directory (for oar-vl pipeline)
+   #[arg(long, env = "VL_MODEL_DIR")]
+   vl_model_dir: Option<String>,
+    /// Path to GLiNER model directory (containing .onnx and tokenizer.json)
+    #[arg(long, default_value = "models/gliner_multi_v2.1")]
+    gliner_dir: String,
 }
 
 async fn auth_middleware(
@@ -159,7 +213,7 @@ struct Metrics {
     exports_succeeded: usize,
     exports_failed: usize,
     last_export_at: Option<String>,
-    collider_metrics: Option<ColliderMetrics>,
+    _collider_metrics: Option<ColliderMetrics>,
 }
 
 
@@ -195,7 +249,178 @@ async fn main() {
         params![],
     ).expect("Failed to create table");
 
+    // B. Model Lifecycle (Bootstrap)
+    let embedding_model_target = args.embedding_model.unwrap_or_else(|| "https://huggingface.co/Xenova/bge-m3/resolve/main/onnx/model_quantized.onnx".to_string());
+    let tokenizer_target = args.tokenizer_model.unwrap_or_else(|| "https://huggingface.co/BAAI/bge-m3/resolve/main/tokenizer.json".to_string());
+
+    let model_path = if embedding_model_target.starts_with("http") {
+         models::ModelManager::ensure_model("bge-m3-int8.onnx", &embedding_model_target, std::path::Path::new("models/bge-m3-int8.onnx")).expect("Failed to download embedding model")
+    } else {
+         std::path::PathBuf::from(embedding_model_target)
+    };
+
+    let tokenizer_path = if tokenizer_target.starts_with("http") {
+         models::ModelManager::ensure_model("tokenizer.json", &tokenizer_target, std::path::Path::new("models/tokenizer.json")).expect("Failed to download tokenizer")
+    } else {
+         std::path::PathBuf::from(tokenizer_target)
+    };
+
+    let ocr_det_target = args.ocr_det_model.unwrap_or_else(|| "https://huggingface.co/marsena/paddleocr-onnx-models/resolve/main/PP-OCRv5_server_det_infer.onnx".to_string());
+    let ocr_rec_target = args.ocr_rec_model.unwrap_or_else(|| "https://huggingface.co/monkt/paddleocr-onnx/resolve/main/languages/latin/rec.onnx".to_string());
+
+    let ocr_det_path = if ocr_det_target.starts_with("http") {
+        models::ModelManager::ensure_model("ocr_det.onnx", &ocr_det_target, std::path::Path::new("models/ocr_det.onnx")).expect("Failed to download OCR Detection model")
+    } else {
+        std::path::PathBuf::from(ocr_det_target)
+    };
+
+    let ocr_rec_path = if ocr_rec_target.starts_with("http") {
+        models::ModelManager::ensure_model("ocr_rec.onnx", &ocr_rec_target, std::path::Path::new("models/ocr_rec.onnx")).expect("Failed to download OCR Recognition model")
+    } else {
+        std::path::PathBuf::from(ocr_rec_target)
+    };
+
+    let ocr_layout_target = args.ocr_layout_model.or_else(|| {
+         if std::path::Path::new("models/picodet_layout_1x.onnx").exists() {
+             Some("models/picodet_layout_1x.onnx".to_string())
+         } else if std::path::Path::new("models/layout.onnx").exists() {
+             Some("models/layout.onnx".to_string())
+         } else {
+             Some("https://huggingface.co/cycloneboy/picodet_lcnet_x1_0_fgd_layout_infer/resolve/main/model.onnx".to_string())
+         }
+    }).unwrap();
+    
+    let ocr_layout_path = if ocr_layout_target.starts_with("http") {
+         models::ModelManager::ensure_model("layout.onnx", &ocr_layout_target, std::path::Path::new("models/layout.onnx")).ok()
+    } else {
+         Some(std::path::PathBuf::from(ocr_layout_target))
+    };
+
+    let ocr_table_target = args.ocr_table_model.or_else(|| {
+        if std::path::Path::new("models/table_structure.onnx").exists() {
+            Some("models/table_structure.onnx".to_string())
+        } else if std::path::Path::new("models/SLANet.onnx").exists() {
+            Some("models/SLANet.onnx".to_string())
+        } else {
+            Some("https://huggingface.co/opendatalab/PDF-Extract-Kit-1.0/resolve/main/models/TabRec/SlanetPlus/slanet-plus.onnx".to_string())
+        }
+    });
+
+    let ocr_table_path = if let Some(target) = ocr_table_target {
+        if target.starts_with("http") {
+             models::ModelManager::ensure_model("table_structure.onnx", &target, std::path::Path::new("models/table_structure.onnx")).ok()
+        } else {
+             Some(std::path::PathBuf::from(target))
+        }
+    } else {
+        None
+    };
+
+    let ocr_table_cell_path = if let Some(target) = args.ocr_table_cell_model {
+        if target.starts_with("http") {
+             models::ModelManager::ensure_model("table_cell_det.onnx", &target, std::path::Path::new("models/table_cell_det.onnx"))
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+        } else {
+             Some(target)
+        }
+    } else {
+        if std::path::Path::new("models/table_cell_det.onnx").exists() {
+             Some("models/table_cell_det.onnx".to_string())
+        } else {
+             None
+        }
+    };
+
+    let ocr_keys_target = args.ocr_keys_model.unwrap_or_else(|| "https://raw.githubusercontent.com/PaddlePaddle/PaddleOCR/release/2.6/ppocr/utils/dict/latin_dict.txt".to_string());
+    
+    let ocr_keys_path = if ocr_keys_target.starts_with("http") {
+         models::ModelManager::ensure_model("ocr_keys.txt", &ocr_keys_target, std::path::Path::new("models/ocr_keys.txt")).expect("Failed to download OCR keys")
+    } else {
+         std::path::PathBuf::from(ocr_keys_target)
+    };
+
     let (tx_notify, _) = broadcast::channel(100);
+
+    // C. Initialize OCR Pipeline
+    #[cfg(feature = "oar")]
+    let pipeline_type: ocr_pipeline::PipelineType = args.ocr_pipeline.parse()
+        .unwrap_or_else(|e| {
+            warn!("⚠️  Invalid OCR pipeline, falling back to legacy: {}", e);
+            ocr_pipeline::PipelineType::Legacy
+        });
+
+    #[cfg(feature = "oar")]
+    let ocr_pipeline: Option<Box<dyn ocr_pipeline::OcrPipelineTrait>> = match pipeline_type {
+        ocr_pipeline::PipelineType::Legacy => {
+            info!("📄 Using Legacy OCR Pipeline (custom PP-StructureV3)");
+            Some(Box::new(ocr_pipeline::LegacyPipeline))
+        }
+        ocr_pipeline::PipelineType::OarStructure => {
+            info!("📄 Using OAR Structure Pipeline");
+            let layout_model = ocr_layout_path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "models/picodet_layout_1x.onnx".into());
+            info!("🛠️  Layout Model Path: '{}'", layout_model);
+            let table_structure = ocr_table_path.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "models/slanext_wired.onnx".into());
+            let table_dict = "models/table_structure_dict_ch.txt"; 
+
+            match ocr_pipeline::oar_structure::OarStructurePipeline::new(
+                &layout_model,
+                Some("models/pp-lcnet_x1_0_table_cls.onnx"),
+                ocr_table_cell_path.as_deref(),
+                &table_structure,
+                table_dict,
+                &ocr_det_path.to_string_lossy(),
+                &ocr_rec_path.to_string_lossy(),
+                &ocr_keys_path.to_string_lossy(),
+            ) {
+                Ok(p) => Some(Box::new(p)),
+                Err(e) => {
+                    warn!("⚠️  Failed to initialize OAR Structure Pipeline: {}. Falling back to legacy.", e);
+                    Some(Box::new(ocr_pipeline::LegacyPipeline))
+                }
+            }
+        }
+        #[cfg(feature = "vl")]
+        ocr_pipeline::PipelineType::OarVL => {
+            info!("📄 Using OAR VL Pipeline (PaddleOCR-VL)");
+            let model_dir = args.vl_model_dir.unwrap_or_else(|| "models/PaddleOCR-VL".into());
+            match ocr_pipeline::oar_vl::OarVLPipeline::new(&model_dir, true) {
+                Ok(p) => Some(Box::new(p)),
+                Err(e) => {
+                    warn!("⚠️  Failed to initialize OAR VL Pipeline: {}. Falling back to legacy.", e);
+                    Some(Box::new(ocr_pipeline::LegacyPipeline))
+                }
+            }
+        }
+        #[allow(unreachable_patterns)]
+        _ => {
+            warn!("⚠️  Selected pipeline feature not enabled, fallback to legacy");
+            Some(Box::new(ocr_pipeline::LegacyPipeline))
+        }
+    };
+    
+    #[cfg(not(feature = "oar"))]
+    let ocr_pipeline: Option<Box<dyn std::any::Any>> = None; // Dummy type
+
+    // 7. Initialize GLiNER
+    #[cfg(feature = "oar")]
+    let gliner_model = if std::path::Path::new(&args.gliner_dir).exists() {
+        info!("🧠 Loading GLiNER Model from: {}", args.gliner_dir);
+        match crate::gliner::GlinerModel::new(&args.gliner_dir) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                warn!("⚠️  Failed to load GLiNER: {}. NER will be disabled.", e);
+                None
+            }
+        }
+    } else {
+        warn!("⚠️  GLiNER directory not found at {}. NER disabled.", args.gliner_dir);
+        None
+    };
+
+    #[cfg(not(feature = "oar"))]
+    let gliner_model: Option<()> = None;
+
     let state = Arc::new(AppState {
         db: Mutex::new(conn),
         schemas: RwLock::new(HashMap::new()),
@@ -214,21 +439,29 @@ async fn main() {
         metrics: Mutex::new(Metrics::default()),
         auth_token: args.token,
         tx_notify: tx_notify.clone(),
-        collider: SharedCollider::new("models/bge-m3-int8.onnx", "models/tokenizer.json").unwrap_or_else(|e| {
-            warn!("⚠️  Physics Engine Model not found/failed: {}. Running in dummy mode.", e);
-            // Fallback would go here, for now we panic or loop.
-            // Since this is a critical component for this task, let's panic but nicely.
-            // Actually, for "preparation" step we just made empty files, so `ort` might fail to load invalid onnx.
-            // We should arguably make the collider optional or handle current state. 
-            // For now, let's allow it to fail initiation but maybe not crash the whole app? 
-            // The unwrap_or_else needs to return Arc<SharedCollider>.
-            // Since we can't easily mock it without a trait, let's just panic if metrics are critical, 
-            // OR we fix the task to ensure valid models.
-            // Given the task is "Download/Mock" and I touched empty files, `ort` will error.
-            // I'll make it panic to force me to fix the model loading if it errors, 
-            // BUT since this is a demo, I'll stick to a panic with a good message.
-            panic!("Physics Engine critical failure: {}", e);
-        }),
+        collider: {
+            #[cfg(feature = "oar")]
+            {
+               LockedCollider::new(
+                   ocr_pipeline, 
+                   gliner_model,
+                   model_path.to_str(),
+                   tokenizer_path.to_str()
+               ).unwrap_or_else(|e| {
+                   panic!("Physics Engine critical failure: {}", e);
+               }) 
+            }
+            #[cfg(not(feature = "oar"))]
+            {
+               LockedCollider::new(
+                   None,
+                   model_path.to_str(),
+                   tokenizer_path.to_str()
+               ).unwrap_or_else(|e| {
+                   panic!("Physics Engine critical failure: {}", e);
+               })
+            }
+        },
     });
 
     // Graceful shutdown signal handler
@@ -507,18 +740,62 @@ async fn ingest_handler(
          hasher.finish()
     };
     
-    let event = ConversationEvent {
+    let type_name_clone = type_name.clone();
+
+    // Extract image_path if present in payload
+    let image_path = parsed.payload.get("image_path")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let mut event = ConversationEvent {
         text,
         conversation_hash,
         actor_type: 1, // Human/System
+        image_path,
         ..Default::default()
     };
 
     // Offload to blocking thread if needed, or just run (it sends to background via ONNX internal threads maybe?)
     // But `embed` is blocking. So `spawn_blocking` is best.
     tokio::task::spawn_blocking(move || {
-        if let Err(e) = collider.smash(&event) {
+        if let Err(e) = collider.smash(&mut event) {
             error!("Physics Engine Smash Error: {}", e);
+        }
+
+        // 7.5 GLiNER NER (if enabled)
+        #[cfg(feature = "oar")]
+        {
+             let mut c = collider.inner.lock();
+             if let Ok(entities) = c.process_ner(&event.text) {
+                 if !entities.is_empty() {
+                     info!("🧬 NER Extracted {} entities", entities.len());
+                     for entity in entities {
+                         info!("   - {}: {} ({:.2})", entity.label, entity.text, entity.score);
+                     }
+                 }
+             }
+        }
+
+        // 8. Structured Extraction if OCR happened
+        let type_name_target = type_name_clone.clone();
+        let text_target = event.text.clone();
+        let image_filename = event.image_path.as_ref()
+            .map(|p| std::path::Path::new(p).file_name().unwrap_or_default().to_string_lossy().to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        
+
+        
+        // 8. Structured Extraction if OCR happened (and model available)
+        let type_name_target = type_name_clone.clone();
+        let text_target = event.text.clone();
+        
+        {
+            let mut collider_guard = state.collider.inner.lock();
+            if let Some(model) = &mut collider_guard.gliner_model { 
+                 if let Some(json) = Some(extract_structured_data(&text_target, model)) {
+                     info!("✅ Structured Data Extracted for {}: {}", type_name_target, json);
+                 }
+            }
         }
     });
 
@@ -656,6 +933,8 @@ struct LLMResponse {
     slots: Vec<Slot>,
     #[serde(default)]
     message: Option<String>,
+    #[serde(default)]
+    structured_data: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -706,11 +985,30 @@ async fn call_llm(
         .as_str()
         .ok_or("Invalid LLM response structure")?;
 
+    info!("🤖 Raw LLM Content: {}", text_content);
+
     // Strip thinking chain (e.g., <think>...</think>) from Qwen and similar models
     let cleaned = strip_thinking_chain(text_content);
+    info!("🤖 Cleaned LLM JSON: {}", cleaned);
 
     // Parse the JSON string
-    serde_json::from_str(&cleaned).map_err(|e| format!("Failed to parse JSON from LLM: {}. Content: {}", e, cleaned))
+    match serde_json::from_str::<LLMResponse>(&cleaned) {
+        Ok(res) if res.intent.is_some() || res.message.is_some() || !res.slots.is_empty() => {
+             Ok(res)
+        },
+        _ => {
+            // Fallback: If it's valid JSON but not a full LLMResponse, wrap it
+            match serde_json::from_str::<serde_json::Value>(&cleaned) {
+                Ok(val) => Ok(LLMResponse {
+                    intent: None,
+                    slots: Vec::new(),
+                    message: None,
+                    structured_data: Some(val),
+                }),
+                Err(e) => Err(format!("Failed to parse JSON from LLM: {}. Content: {}", e, cleaned))
+            }
+        }
+    }
 }
 
 /// Strip <think>...</think> tags and extract JSON from LLM response
@@ -733,6 +1031,47 @@ fn strip_thinking_chain(content: &str) -> String {
     }
     
     trimmed.to_string()
+}
+
+/// Extract structured JSON from OCR content using the local LLM
+/// Extract structured JSON using GLiNER v2
+fn extract_structured_data(text: &str, ner_model: &mut GlinerModel) -> serde_json::Value {
+    // Define the schema (prompts) we want to extract
+    // For invoices, especially Portuguese ones
+    let schema = vec![
+        "Invoice Number", "Número da Nota",
+        "Total Amount", "Valor Total", 
+        "Date", "Data de Emissão",
+        "Vendor", "Emitente",
+        "Receiver", "Destinatário",
+        "CNPJ",
+        "Item Description", "Descrição",
+        "Tax", "Imposto"
+    ];
+
+    match ner_model.predict_entities(text, &schema, 0.4) {
+        Ok(entities) => {
+            // Group by label
+            let mut map = serde_json::Map::new();
+            for entity in entities {
+                // Take the first occurrence or list? For simple KV, list might be better or last.
+                // Let's use a list for repeated fields.
+                let key = entity.label;
+                let val = serde_json::Value::String(entity.text);
+                
+                map.entry(key)
+                    .or_insert_with(|| serde_json::Value::Array(Vec::new()))
+                    .as_array_mut()
+                    .unwrap()
+                    .push(val);
+            }
+            serde_json::Value::Object(map)
+        },
+        Err(e) => {
+            eprintln!("GLiNER extraction failed: {}", e);
+            serde_json::json!({"error": e.to_string()})
+        }
+    }
 }
 
 #[derive(Serialize)]

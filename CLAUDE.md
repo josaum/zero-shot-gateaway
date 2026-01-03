@@ -5,21 +5,21 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Build & Test Commands
 
 ```bash
-# Build and run with ONNX Runtime support
-DYLD_LIBRARY_PATH="/opt/homebrew/lib" cargo run --release
+# Build and run with Full Capability (OCR, NER, etc.)
+DYLD_LIBRARY_PATH="/opt/homebrew/lib" cargo run --release --features oar
 
 # Headless mode (no TUI)
-DYLD_LIBRARY_PATH="/opt/homebrew/lib" cargo run --release -- --no-tui
+DYLD_LIBRARY_PATH="/opt/homebrew/lib" cargo run --release --features oar -- --no-tui
 
 # Python consumer
-python consumer.py --follow    # Real-time monitoring
-python consumer.py --batch 100 # Batch processing
-python consumer.py --pytorch   # PyTorch tensor output
+python scripts/consumer.py --follow    # Real-time monitoring
+python scripts/consumer.py --batch 100 # Batch processing
+python scripts/consumer.py --pytorch   # PyTorch tensor output
 
 # Standard Rust commands
-cargo check             # Type checking
-cargo clippy            # Lint
-cargo fmt               # Format
+cargo check --features oar  # Type checking
+cargo clippy --features oar # Lint
+cargo fmt                   # Format
 ```
 
 ## Architecture Overview
@@ -31,24 +31,34 @@ cargo fmt               # Format
 | API Server | `main.rs` | Axum (port 9382) |
 | Database | `main.rs` | DuckDB + Arrow IPC |
 | Physics Engine | `collider.rs` | Shared Memory + SeqLock |
+| NER Engine | `gliner.rs` | Local ONNX (GLiNER) |
+| OCR Pipeline | `ocr_pipeline.rs` | Local ONNX (OAR-OCR) |
 | LLM Integration | `main.rs` | LM Studio / OpenAI API |
 | Terminal UI | `tui.rs` | Ratatui |
-| Python Consumer | `consumer.py` | mmap + numpy |
+| Python Consumer | `scripts/consumer.py` | mmap + numpy |
 
 ## Key Modules
 
 ### `src/collider.rs` — Physics Engine
 - **ParticleFrame**: 4KB aligned struct with semantic embeddings, kinetics, spin
 - **SeqLock Protocol**: Lock-free concurrent read/write
+- **Deep Zero-Copy**: Uses `ort::IoBinding` to write ONNX outputs directly to shared memory
 - **Shared Memory**: `/tmp/cs_physics` (macOS) or `/dev/shm/cs_physics` (Linux)
-- **Embeddings**: Via LM Studio API (`text-embedding-bge-m3@f16`)
+
+### `src/gliner.rs` — NER Engine
+- **Zero-Shot NER**: Running `gliner_base.onnx` locally
+- **Output**: Extracts Entities and spans for structured storage
+
+### `src/ocr_pipeline.rs` — Document AI
+- **OAR-OCR**: Detection, Recognition, Layout, Table Extraction
+- **Pipelines**: `legacy`, `oar-structure`, `oar-vl`
 
 ### `src/main.rs` — Gateway Core
 - **LLM Integration**: `call_llm()` calls LM Studio with thinking-model support
 - **strip_thinking_chain()**: Extracts JSON from `<think>...</think>` output
-- **ingest_handler()**: Processes events → LLM → Physics Engine → DuckDB
+- **ingest_handler()**: Processes events → LLM → GLiNER → Physics Engine → DuckDB
 
-### `consumer.py` — Python Consumer
+### `scripts/consumer.py` — Python Consumer
 - **PhysicsConsumer**: Memory-mapped reader with SeqLock
 - **PyTorchConsumer**: Returns `torch.Tensor` directly
 - **Modes**: `--follow`, `--batch N`, `--pytorch`
